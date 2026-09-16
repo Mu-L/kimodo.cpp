@@ -1,0 +1,1 @@
+A person running diagonally to their right jumps over an obstacle and then continues running.

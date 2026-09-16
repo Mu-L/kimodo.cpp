@@ -25,6 +25,9 @@ import (
 //go:embed index.html
 var files embed.FS
 
+//go:embed comparison.html
+var comparisonPage []byte
+
 //go:embed models.js
 var modelUI []byte
 
@@ -80,6 +83,18 @@ func token() string {
 		panic(err)
 	}
 	return hex.EncodeToString(b)
+}
+
+func safePathPart(value string) bool {
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
 func (g *gallery) save(a *animation) error {
 	b, err := json.MarshalIndent(a, "", "  ")
@@ -347,6 +362,7 @@ func main() {
 	text := flag.String("text-bundle", "generated/llm2vec-text-bundle", "native LLM2Vec component directory")
 	generator := flag.String("generator", "build/debug/kmd-generate", "native text-to-motion command")
 	output := flag.String("output", "demo-output", "persistent gallery directory")
+	comparisons := flag.String("comparisons", "quantization-comparisons", "viewer-ready quantization comparison directories")
 	flag.Parse()
 	if err := os.MkdirAll(*output, 0755); err != nil {
 		log.Fatal(err)
@@ -404,6 +420,50 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(index)
+	})
+	mux.HandleFunc("/compare", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/compare" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(comparisonPage)
+	})
+	mux.HandleFunc("/api/comparisons", func(w http.ResponseWriter, r *http.Request) {
+		entries, _ := os.ReadDir(*comparisons)
+		result := make([]json.RawMessage, 0, len(entries))
+		for _, entry := range entries {
+			if !entry.IsDir() || !safePathPart(entry.Name()) {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(*comparisons, entry.Name(), "comparison.json"))
+			if err == nil && json.Valid(data) {
+				result = append(result, data)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})
+	mux.HandleFunc("/api/comparisons/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/comparisons/"), "/")
+		if len(parts) < 2 || len(parts) > 3 || !safePathPart(parts[0]) {
+			http.NotFound(w, r)
+			return
+		}
+		var path string
+		if len(parts) == 2 && parts[1] == "comparison.json" {
+			path = filepath.Join(*comparisons, parts[0], "comparison.json")
+			w.Header().Set("Content-Type", "application/json")
+		} else if len(parts) == 3 && safePathPart(parts[1]) &&
+			(parts[2] == "root_positions.f32" || parts[2] == "local_rotations_xyzw.f32") {
+			path = filepath.Join(*comparisons, parts[0], parts[1], parts[2])
+			w.Header().Set("Content-Type", "application/octet-stream")
+		} else {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, path)
 	})
 	mux.HandleFunc("/localai.png", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")

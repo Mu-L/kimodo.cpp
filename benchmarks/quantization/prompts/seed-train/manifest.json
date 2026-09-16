@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "provenance": "NVIDIA BONES-SEED timeline annotation whose filename is present in train_split_paths.txt",
+  "train_split_sha256": "9fd3d85c1be6c44234f17b86840c71a6cbf36aa5d2294547fb5b89d7a624c5b8",
+  "timelines_sha256": "379d6a5b86cea06b7201d485d19ee53512cc58449352b3cf113a95d1d27603d8",
+  "exemplars": [
+    {
+      "category": "walk",
+      "prompt": "A person standing in an upright stance starts to walk backwards.",
+      "filename": "Jump_Backward_Left_004__A017",
+      "train_split_entry": "220705/Jump_Backward_Left_004__A017",
+      "start_time": 3.55,
+      "end_time": 5.15,
+      "duration_seconds": 1.6000000000000005,
+      "prompt_file": "01-walk.txt"
+    },
+    {
+      "category": "run",
+      "prompt": "A person running diagonally to their right jumps over an obstacle and then continues running.",
+      "filename": "avoid_obstacle_jump_run_ff_180_R_002__A500",
+      "train_split_entry": "231110/avoid_obstacle_jump_run_ff_180_R_002__A500",
+      "start_time": 0.0,
+      "end_time": 2.3,
+      "duration_seconds": 2.3,
+      "prompt_file": "02-run.txt"
+    },
+    {
+      "category": "jump",
+      "prompt": "A person standing straight jumps in one place and lands back on the ground with ease.",
+      "filename": "Jump_002__A017",
+      "train_split_entry": "220705/Jump_002__A017",
+      "start_time": 0.0,
+      "end_time": 1.55,
+      "duration_seconds": 1.55,
+      "prompt_file": "03-jump.txt"
+    },
+    {
+      "category": "turn",
+      "prompt": "A person slowly walks backward and turns to the left side.",
+      "filename": "Jump_Backward_Left_004__A017",
+      "train_split_entry": "220705/Jump_Backward_Left_004__A017",
+      "start_time": 5.15,
+      "end_time": 7.15,
+      "duration_seconds": 2.0,
+      "prompt_file": "04-turn.txt"
+    },
+    {
+      "category": "crouch",
+      "prompt": "The person bends down and sits in a squat position.",
+      "filename": "baby_full_diaper_pick_up_R_001__A463",
+      "train_split_entry": "231005/baby_full_diaper_pick_up_R_001__A463",
+      "start_time": 2.92,
+      "end_time": 4.51,
+      "duration_seconds": 1.5899999999999999,
+      "prompt_file": "05-crouch.txt"
+    },
+    {
+      "category": "wave",
+      "prompt": "A person waves their right hand holding a cellphone, then turns to the right while standing on their toes to look for service.",
+      "filename": "cellphone_looking_for_service_stand_R_001__A427",
+      "train_split_entry": "230711/cellphone_looking_for_service_stand_R_001__A427",
+      "start_time": 8.0,
+      "end_time": 9.73,
+      "duration_seconds": 1.7300000000000004,
+      "prompt_file": "06-wave.txt"
+    },
+    {
+      "category": "kick",
+      "prompt": "A person walking forward kicks the trash with their right leg and again starts walking.",
+      "filename": "Neutral_kick_trash_001__A057",
+      "train_split_entry": "211117/Neutral_kick_trash_001__A057",
+      "start_time": 1.7,
+      "end_time": 3.6,
+      "duration_seconds": 1.9000000000000001,
+      "prompt_file": "07-kick.txt"
+    },
+    {
+      "category": "punch",
+      "prompt": "The person with an injured right leg throws three punches and a kick.",
+      "filename": "choreography1_injured_R_leg_001__A006",
+      "train_split_entry": "210707/choreography1_injured_R_leg_001__A006",
+      "start_time": 92.0,
+      "end_time": 95.63,
+      "duration_seconds": 3.6299999999999955,
+      "prompt_file": "08-punch.txt"
+    },
+    {
+      "category": "dance",
+      "prompt": "A person is performing a forward-facing dance involving multiple quick turns, maintaining a poised upper body posture and dynamic lower body motion.",
+      "filename": "dance_basic_chaines_180_R_001__A306",
+      "train_split_entry": "230411/dance_basic_chaines_180_R_001__A306",
+      "start_time": 0.1,
+      "end_time": 4.0,
+      "duration_seconds": 3.9,
+      "prompt_file": "09-dance.txt"
+    },
+    {
+      "category": "sit",
+      "prompt": "A person sits angled with their head towards the left diagonal as they cycle their legs lifted above the ground.",
+      "filename": "ab_bicycle_001__A360",
+      "train_split_entry": "230509/ab_bicycle_001__A360",
+      "start_time": 3.8,
+      "end_time": 9.32,
+      "duration_seconds": 5.5200000000000005,
+      "prompt_file": "10-sit.txt"
+    },
+    {
+      "category": "reach",
+      "prompt": "A person turns around and reaches for an object above.",
+      "filename": "big_heavy_one_hand_behind_high_to_behind_low_R_001__A526",
+      "train_split_entry": "231120/big_heavy_one_hand_behind_high_to_behind_low_R_001__A526",
+      "start_time": 0.0,
+      "end_time": 1.94,
+      "duration_seconds": 1.94,
+      "prompt_file": "11-reach.txt"
+    },
+    {
+      "category": "gesture",
+      "prompt": "The person lifts their hands and plays a game that involves clapping.",
+      "filename": "anse_kabanse_R_001__A458",
+      "train_split_entry": "231004/anse_kabanse_R_001__A458",
+      "start_time": 0.0,
+      "end_time": 7.8,
+      "duration_seconds": 7.8,
+      "prompt_file": "12-gesture.txt"
+    }
+  ]
+}

@@ -19,9 +19,10 @@ default; set `KIMODO_TEXT_LAYER_CHUNK=1..32` to tune VRAM use.
 
 Included: checked GGUF loading, safetensors conversion, DDIM sampling, C/C++
 APIs, conditioned multi-prompt transitions, CPU/Vulkan parity tests,
-skeleton-only GLB export, and a local text-to-motion demo. General constraint
-input, 77-joint SOMA expansion, skinned-mesh GLB export, and quantised models
-are not implemented yet.
+skeleton-only GLB export, selective LLM2Vec quantisation, divergence reporting,
+and local generation/comparison viewers. General constraint input, 77-joint
+SOMA expansion, skinned-mesh GLB export, and motion-denoiser quantisation are
+not implemented yet.
 
 ## Build and test on Linux
 
@@ -86,6 +87,12 @@ new generation. Every successful animation also writes a standalone
 node hierarchy (no mesh), ready to copy into a Three.js project. It is also
 available from `/api/animations/<animation-id>/animation.glb` while the demo
 is running.
+
+Quantisation comparisons produced by the workflow in
+[`docs/QUANTIZATION.md`](docs/QUANTIZATION.md) can be opened at
+`http://localhost:8094/compare`. Supply their parent directory with the demo's
+`--comparisons` option. The comparison view overlays every variant on a shared
+timeline and provides world-space and root-position-aligned modes.
 
 ## Weights
 

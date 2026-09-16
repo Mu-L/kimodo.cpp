@@ -1,0 +1,1 @@
+A person runs forward and then leaps over an obstacle in front of them.

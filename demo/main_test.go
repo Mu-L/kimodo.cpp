@@ -28,6 +28,19 @@ func TestWriteSkeletonGLB(t *testing.T) {
 	}
 }
 
+func TestSafePathPart(t *testing.T) {
+	for _, value := range []string{"q8_0", "run-jump.seed42", "BF16"} {
+		if !safePathPart(value) {
+			t.Fatalf("expected safe path part: %q", value)
+		}
+	}
+	for _, value := range []string{"", ".", "..", "../escape", "a/b", "space here"} {
+		if safePathPart(value) {
+			t.Fatalf("expected unsafe path part: %q", value)
+		}
+	}
+}
+
 func assertSkeletonGLB(t *testing.T, path string, expectedJoints int) {
 	t.Helper()
 	b, err := os.ReadFile(path)

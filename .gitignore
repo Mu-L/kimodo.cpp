@@ -24,6 +24,7 @@
 !/models/MANIFEST.md
 /generated/
 /demo-output/
+/quantization-comparisons/
 *.gguf
 *.safetensors
 *.pth

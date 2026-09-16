@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -43,6 +45,19 @@ int layer_chunk_size() {
     if (error != std::errc{} || *end != '\0' || parsed < 1 || parsed > 32)
         throw std::runtime_error("KIMODO_TEXT_LAYER_CHUNK must be in 1..32");
     return parsed;
+}
+
+int cpu_thread_count() noexcept {
+    unsigned threads = std::max(1U, std::thread::hardware_concurrency());
+    if (const char *value = std::getenv("KIMODO_THREADS")) {
+        char *end = nullptr;
+        errno = 0;
+        const long requested = std::strtol(value, &end, 10);
+        if (errno == 0 && end != value && *end == '\0' && requested > 0 &&
+            requested <= std::numeric_limits<int>::max())
+            threads = static_cast<unsigned>(requested);
+    }
+    return static_cast<int>(std::min<unsigned>(threads, std::numeric_limits<int>::max()));
 }
 
 struct component {
@@ -72,7 +87,9 @@ std::unique_ptr<component> open_component(const std::filesystem::path &path, ggm
     std::vector<char> scratch(8U * 1024U * 1024U);
     for (int64_t i = 0; i < gguf_get_n_tensors(result->file); ++i) {
         auto *tensor = ggml_get_tensor(result->ctx, gguf_get_tensor_name(result->file, i));
-        if (!tensor || (tensor->type != GGML_TYPE_BF16 && tensor->type != GGML_TYPE_F32))
+        if (!tensor || (tensor->type != GGML_TYPE_BF16 && tensor->type != GGML_TYPE_F32 &&
+                        tensor->type != GGML_TYPE_Q8_0 && tensor->type != GGML_TYPE_Q6_K &&
+                        tensor->type != GGML_TYPE_Q5_K && tensor->type != GGML_TYPE_Q4_K))
             throw std::runtime_error("invalid text tensor");
         const size_t bytes = ggml_nbytes(tensor);
         const size_t offset = gguf_get_tensor_offset(result->file, i);
@@ -130,7 +147,10 @@ ggml_tensor *layer_graph(ggml_context *ctx, ggml_tensor *x, ggml_tensor *positio
     auto base = [&](const char *name, ggml_tensor *value) {
         const std::string prefix(name);
         auto *weight = model.tensor((prefix + "_base.weight").c_str());
-        if (!weight || weight->type != GGML_TYPE_BF16) throw std::runtime_error("missing base projection");
+        if (!weight || (weight->type != GGML_TYPE_BF16 && weight->type != GGML_TYPE_Q8_0 &&
+                        weight->type != GGML_TYPE_Q6_K && weight->type != GGML_TYPE_Q5_K &&
+                        weight->type != GGML_TYPE_Q4_K))
+            throw std::runtime_error("missing or unsupported base projection");
         // Vulkan's BF16 matrix-vector kernel rejects BF16 right operands. A
         // F32 cast preserves the BF16 values while taking its supported path.
         return ggml_mul_mat(ctx, weight, value->type == GGML_TYPE_F32 ? value : ggml_cast(ctx, value, GGML_TYPE_F32));
@@ -222,7 +242,7 @@ std::expected<std::unique_ptr<llm_text_encoder>, std::string> llm_text_encoder::
     if (!result->impl_->backend) {
         result->impl_->backend = ggml_backend_cpu_init();
         if (!result->impl_->backend) return std::unexpected("cannot initialize text backend");
-        ggml_backend_cpu_set_n_threads(result->impl_->backend, static_cast<int>(std::max(1U, std::thread::hardware_concurrency())));
+        ggml_backend_cpu_set_n_threads(result->impl_->backend, cpu_thread_count());
     }
     auto tokenizer = llm_tokenizer::load((path / "tokenizer.gguf").string());
     if (!tokenizer) return std::unexpected(tokenizer.error());
