@@ -89,6 +89,10 @@ node hierarchy (no mesh), ready to copy into a Three.js project. It is also
 available from `/api/animations/<animation-id>/animation.glb` while the demo
 is running.
 
+The demo loads all 32 text-encoder layers in one chunk for maximum throughput.
+Library and command-line callers retain the lower-memory eight-layer default;
+set `KIMODO_TEXT_LAYER_CHUNK=1..32` to choose another tradeoff.
+
 Quantisation comparisons produced by the workflow in
 [`docs/QUANTIZATION.md`](docs/QUANTIZATION.md) can be opened at
 `http://localhost:8094/compare`. Supply their parent directory with the demo's

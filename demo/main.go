@@ -345,7 +345,7 @@ func (g *gallery) worker() {
 						_ = g.save(item)
 						g.mu.Unlock()
 						cmd := exec.Command(g.generator, args...)
-						cmd.Env = append(os.Environ(), "KIMODO_BACKEND=vulkan")
+						cmd.Env = append(os.Environ(), "KIMODO_BACKEND=vulkan", "KIMODO_TEXT_LAYER_CHUNK=32")
 						output, runErr := cmd.CombinedOutput()
 						if runErr != nil {
 							err = fmt.Errorf("sequence: %w: %s", runErr, strings.TrimSpace(string(output)))
