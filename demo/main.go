@@ -45,6 +45,7 @@ type animation struct {
 	Error            string          `json:"error,omitempty"`
 	Kind             string          `json:"kind"`
 	Model            string          `json:"model"`
+	TextQuantization string          `json:"text_quantization"`
 	Segments         []promptSegment `json:"segments,omitempty"`
 	TransitionFrames int             `json:"transition_frames,omitempty"`
 	Progress         string          `json:"progress,omitempty"`
@@ -68,13 +69,22 @@ type motionModel struct {
 	Offsets     [][3]float32 `json:"offsets"`
 	Motion      string       `json:"-"`
 }
+type textBundle struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Available   bool   `json:"available"`
+	Reason      string `json:"reason,omitempty"`
+	Bytes       int64  `json:"bytes,omitempty"`
+	Path        string `json:"-"`
+}
 type gallery struct {
-	mu                      sync.RWMutex
-	items                   map[string]*animation
-	output                  string
-	queue                   chan string
-	generator, motion, text string
-	models                  map[string]motionModel
+	mu                sync.RWMutex
+	items             map[string]*animation
+	output, generator string
+	queue             chan string
+	models            map[string]motionModel
+	textBundles       map[string]textBundle
 }
 
 func token() string {
@@ -308,32 +318,42 @@ func (g *gallery) worker() {
 			if !ok || !model.Available {
 				err = fmt.Errorf("model %q is not available", item.Model)
 			} else {
-				segments := item.Segments
-				if len(segments) == 0 {
-					segments = []promptSegment{{Prompt: item.Prompt, Frames: item.Frames}}
+				textID := item.TextQuantization
+				if textID == "" {
+					textID = "bf16"
 				}
-				args := []string{model.Motion, g.text, "--sequence", fmt.Sprint(item.TransitionFrames), fmt.Sprint(item.DiffusionSteps), fmt.Sprint(item.Seed), dir}
-				for index, segment := range segments {
-					promptPath := filepath.Join(dir, fmt.Sprintf("segment-%02d.txt", index+1))
-					if err = os.WriteFile(promptPath, []byte(segment.Prompt), 0600); err != nil {
-						break
-					}
-					args = append(args, fmt.Sprint(segment.Frames), promptPath)
+				text, textOK := g.textBundles[textID]
+				if !textOK || !text.Available {
+					err = fmt.Errorf("text quantization %q is not available", textID)
 				}
 				if err == nil {
-					g.mu.Lock()
-					item.Progress = fmt.Sprintf("Generating %d conditioned segments", len(segments))
-					_ = g.save(item)
-					g.mu.Unlock()
-					cmd := exec.Command(g.generator, args...)
-					cmd.Env = append(os.Environ(), "KIMODO_BACKEND=vulkan")
-					output, runErr := cmd.CombinedOutput()
-					if runErr != nil {
-						err = fmt.Errorf("sequence: %w: %s", runErr, strings.TrimSpace(string(output)))
+					segments := item.Segments
+					if len(segments) == 0 {
+						segments = []promptSegment{{Prompt: item.Prompt, Frames: item.Frames}}
 					}
-				}
-				if err == nil {
-					err = exportSkeletonGLB(dir, model.SkeletonKey)
+					args := []string{model.Motion, text.Path, "--sequence", fmt.Sprint(item.TransitionFrames), fmt.Sprint(item.DiffusionSteps), fmt.Sprint(item.Seed), dir}
+					for index, segment := range segments {
+						promptPath := filepath.Join(dir, fmt.Sprintf("segment-%02d.txt", index+1))
+						if err = os.WriteFile(promptPath, []byte(segment.Prompt), 0600); err != nil {
+							break
+						}
+						args = append(args, fmt.Sprint(segment.Frames), promptPath)
+					}
+					if err == nil {
+						g.mu.Lock()
+						item.Progress = fmt.Sprintf("Generating %d conditioned segments", len(segments))
+						_ = g.save(item)
+						g.mu.Unlock()
+						cmd := exec.Command(g.generator, args...)
+						cmd.Env = append(os.Environ(), "KIMODO_BACKEND=vulkan")
+						output, runErr := cmd.CombinedOutput()
+						if runErr != nil {
+							err = fmt.Errorf("sequence: %w: %s", runErr, strings.TrimSpace(string(output)))
+						}
+					}
+					if err == nil {
+						err = exportSkeletonGLB(dir, model.SkeletonKey)
+					}
 				}
 			}
 		}
@@ -360,6 +380,11 @@ func main() {
 	g1RP := flag.String("g1-rp-model", "models/kimodo-g1-rp-v1-f32.gguf", "G1 RP v1 motion GGUF")
 	g1SEED := flag.String("g1-seed-model", "models/kimodo-g1-seed-v1-f32.gguf", "G1 SEED v1 motion GGUF")
 	text := flag.String("text-bundle", "generated/llm2vec-text-bundle", "native LLM2Vec component directory")
+	textQ8 := flag.String("text-q8-bundle", "generated/llm2vec-text-q8_0", "Q8_0 LLM2Vec component directory")
+	textQ6 := flag.String("text-q6-bundle", "generated/llm2vec-text-q6_k", "Q6_K LLM2Vec component directory")
+	textQ5 := flag.String("text-q5-bundle", "generated/llm2vec-text-q5_k", "Q5_K LLM2Vec component directory")
+	textQ4 := flag.String("text-q4-bundle", "generated/llm2vec-text-q4_k", "Q4_K LLM2Vec component directory")
+	textQ4Mixed := flag.String("text-q4-mixed-bundle", "generated/llm2vec-text-q4_k_m", "mixed Q4_K LLM2Vec component directory")
 	generator := flag.String("generator", "build/debug/kmd-generate", "native text-to-motion command")
 	output := flag.String("output", "demo-output", "persistent gallery directory")
 	comparisons := flag.String("comparisons", "quantization-comparisons", "viewer-ready quantization comparison directories")
@@ -386,7 +411,35 @@ func main() {
 		"g1-rp-v1":       makeModel("g1-rp-v1", "G1 RP v1", "Unitree G1 34 joints", "g1skel34", "nvidia/Kimodo-G1-RP-v1", "NVIDIA Open Model License", openLicense, *g1RP, true),
 		"g1-seed-v1":     makeModel("g1-seed-v1", "G1 SEED v1", "Unitree G1 34 joints", "g1skel34", "nvidia/Kimodo-G1-SEED-v1", "NVIDIA Open Model License", openLicense, *g1SEED, true),
 	}
-	g := &gallery{items: map[string]*animation{}, output: *output, queue: make(chan string, 32), generator: *generator, motion: *motion, text: *text, models: models}
+	makeTextBundle := func(id, label, description, path string) textBundle {
+		bundle := textBundle{ID: id, Label: label, Description: description, Path: path}
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			bundle.Reason = "bundle not found at " + path
+			return bundle
+		}
+		components, err := filepath.Glob(filepath.Join(path, "*.gguf"))
+		if err != nil || len(components) == 0 {
+			bundle.Reason = "bundle contains no GGUF components"
+			return bundle
+		}
+		for _, component := range components {
+			if componentInfo, statErr := os.Stat(component); statErr == nil {
+				bundle.Bytes += componentInfo.Size()
+			}
+		}
+		bundle.Available = true
+		return bundle
+	}
+	textBundles := map[string]textBundle{
+		"bf16":   makeTextBundle("bf16", "BF16 reference", "Highest-fidelity reference encoder.", *text),
+		"q8_0":   makeTextBundle("q8_0", "Q8_0", "Recommended quantized encoder; closest measured agreement with BF16.", *textQ8),
+		"q6_k":   makeTextBundle("q6_k", "Q6_K", "Smaller experimental encoder with increased motion divergence.", *textQ6),
+		"q5_k":   makeTextBundle("q5_k", "Q5_K", "Experimental; some prompt/noise pairs enter a different trajectory basin.", *textQ5),
+		"q4_k":   makeTextBundle("q4_k", "Q4_K", "Experimental uniform four-bit encoder with substantial measured divergence.", *textQ4),
+		"q4_k_m": makeTextBundle("q4_k_m", "Q4_K mixed", "Experimental mixed-bit profile that improves on uniform Q4_K.", *textQ4Mixed),
+	}
+	g := &gallery{items: map[string]*animation{}, output: *output, queue: make(chan string, 32), generator: *generator, models: models, textBundles: textBundles}
 	entries, _ := filepath.Glob(filepath.Join(*output, "*.json"))
 	for _, path := range entries {
 		b, err := os.ReadFile(path)
@@ -395,6 +448,9 @@ func main() {
 		}
 		var a animation
 		if json.Unmarshal(b, &a) == nil {
+			if a.TextQuantization == "" {
+				a.TextQuantization = "bf16"
+			}
 			g.items[a.ID] = &a
 			if a.Status == "ready" {
 				model, ok := models[a.Model]
@@ -427,6 +483,7 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(comparisonPage)
 	})
 	mux.HandleFunc("/api/comparisons", func(w http.ResponseWriter, r *http.Request) {
@@ -488,6 +545,15 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
 	})
+	mux.HandleFunc("/api/text-quantizations", func(w http.ResponseWriter, r *http.Request) {
+		order := []string{"bf16", "q8_0", "q6_k", "q5_k", "q4_k", "q4_k_m"}
+		result := make([]textBundle, 0, len(order))
+		for _, id := range order {
+			result = append(result, g.textBundles[id])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})
 	mux.HandleFunc("/api/generate", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -502,6 +568,7 @@ func main() {
 			Steps            int             `json:"steps"`
 			Seed             uint64          `json:"seed"`
 			Model            string          `json:"model"`
+			TextQuantization string          `json:"text_quantization"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&request); err != nil {
 			http.Error(w, "invalid JSON", 400)
@@ -541,16 +608,28 @@ func main() {
 		if request.Model == "" {
 			request.Model = "smplx-rp-v1"
 		}
+		if request.TextQuantization == "" {
+			request.TextQuantization = "bf16"
+		}
 		model, ok := g.models[request.Model]
 		if !ok || !model.Available {
 			http.Error(w, "selected motion model is not available: "+model.Reason, http.StatusConflict)
+			return
+		}
+		text, ok := g.textBundles[request.TextQuantization]
+		if !ok {
+			http.Error(w, "unknown text quantization", http.StatusBadRequest)
+			return
+		}
+		if !text.Available {
+			http.Error(w, "selected text quantization is not available: "+text.Reason, http.StatusConflict)
 			return
 		}
 		totalFrames := 0
 		for _, segment := range request.Segments {
 			totalFrames += segment.Frames
 		}
-		a := &animation{ID: token(), Prompt: request.Segments[0].Prompt, Frames: totalFrames, DiffusionSteps: request.Steps, Seed: request.Seed, CreatedAt: time.Now().UTC().Format(time.RFC3339), Status: "queued", Kind: "generated", Model: request.Model, Segments: request.Segments, TransitionFrames: request.TransitionFrames}
+		a := &animation{ID: token(), Prompt: request.Segments[0].Prompt, Frames: totalFrames, DiffusionSteps: request.Steps, Seed: request.Seed, CreatedAt: time.Now().UTC().Format(time.RFC3339), Status: "queued", Kind: "generated", Model: request.Model, TextQuantization: request.TextQuantization, Segments: request.Segments, TransitionFrames: request.TransitionFrames}
 		g.mu.Lock()
 		g.items[a.ID] = a
 		err := g.save(a)

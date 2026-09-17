@@ -4,8 +4,12 @@ window.addEventListener('load', async () => {
   const form = prompt?.closest('.promptbox');
   const generate = document.querySelector('#generate');
   if (!prompt || !form || !generate) return;
-  const models = await fetch('/api/models').then(r => r.json());
+  const [models, quantizations] = await Promise.all([
+    fetch('/api/models').then(r => r.json()),
+    fetch('/api/text-quantizations').then(r => r.json()),
+  ]);
   window.kimodoModels = models;
+  window.kimodoQuantizations = quantizations;
 
   const modelLabel = document.createElement('label');
   modelLabel.htmlFor = 'motionModel'; modelLabel.textContent = 'Motion model';
@@ -31,6 +35,28 @@ window.addEventListener('load', async () => {
   };
   select.onchange = updateModel;
   form.insertBefore(modelLabel, prompt); form.insertBefore(select, prompt); form.insertBefore(modelHint, prompt); updateModel();
+
+  const quantizationLabel = document.createElement('label');
+  quantizationLabel.htmlFor = 'textQuantization'; quantizationLabel.textContent = 'Text encoder quantization';
+  const quantizationSelect = document.createElement('select');
+  quantizationSelect.id = 'textQuantization'; quantizationSelect.style.cssText = select.style.cssText;
+  for (const quantization of quantizations) {
+    const option = document.createElement('option'); option.value = quantization.id;
+    option.disabled = !quantization.available;
+    option.textContent = `${quantization.label}${quantization.available ? '' : ' — unavailable'}`;
+    quantizationSelect.append(option);
+  }
+  const quantizationHint = document.createElement('div'); quantizationHint.className = 'hint';
+  const updateQuantization = () => {
+    const quantization = quantizations.find(item => item.id === quantizationSelect.value);
+    if (!quantization) return;
+    const size = quantization.bytes ? `${(quantization.bytes / 1073741824).toFixed(2)} GiB · ` : '';
+    quantizationHint.textContent = quantization.available
+      ? `${size}${quantization.description}`
+      : quantization.reason;
+  };
+  quantizationSelect.onchange = updateQuantization;
+  form.insertBefore(quantizationLabel, prompt); form.insertBefore(quantizationSelect, prompt); form.insertBefore(quantizationHint, prompt); updateQuantization();
 
   const sequence = document.createElement('div');
   sequence.style.cssText = 'display:grid;gap:10px;width:100%';
@@ -84,10 +110,14 @@ window.addEventListener('load', async () => {
   // The gallery owns the selected animation; receive its full saved sequence
   // rather than restoring only animation.prompt (the first segment).
   window.addEventListener('kimodo:restore-sequence', event => {
-    const {segments, model} = event.detail || {};
+    const {segments, model, text_quantization: textQuantization} = event.detail || {};
     if (model && [...select.options].some(option => option.value === model)) {
       select.value = model;
       updateModel();
+    }
+    if (textQuantization && [...quantizationSelect.options].some(option => option.value === textQuantization && !option.disabled)) {
+      quantizationSelect.value = textQuantization;
+      updateQuantization();
     }
     const restored = Array.isArray(segments) && segments.length
       ? segments
@@ -110,6 +140,7 @@ window.addEventListener('load', async () => {
     if (typeof input === 'string' && input.endsWith('/api/generate') && init?.body) {
       const body = JSON.parse(init.body);
       body.model = select.value;
+      body.text_quantization = quantizationSelect.value;
       body.transition_frames = 5;
       body.segments = [...sequence.querySelectorAll('.sequence-prompt')].map(area => {
         const row = area.closest('div');

@@ -80,8 +80,9 @@ go run ./demo -addr 0.0.0.0:8094
 ```
 
 Open `http://localhost:8094`. The left sidebar contains the prompt and a
-persistent history; choosing a previous animation restores its prompt for a
-new generation. Every successful animation also writes a standalone
+persistent history plus motion-model and text-encoder-quantization selectors;
+choosing a previous animation restores its prompt and encoder choice for a new
+generation. Every successful animation also writes a standalone
 `animation.glb` beside its raw streams, for example
 `demo-output/<animation-id>/animation.glb`. It contains the selected animated
 node hierarchy (no mesh), ready to copy into a Three.js project. It is also
