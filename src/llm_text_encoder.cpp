@@ -29,6 +29,8 @@
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace kimodo::detail {
@@ -92,6 +94,12 @@ struct component {
     ggml_tensor *tensor(const char *name) const { return ggml_get_tensor(ctx, name); }
 };
 
+bool valid_weight_type(ggml_type type) {
+    return type == GGML_TYPE_BF16 || type == GGML_TYPE_F32 ||
+           type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K ||
+           type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_K;
+}
+
 std::unique_ptr<component> open_component(const std::filesystem::path &path, ggml_backend_t backend) {
     const auto started = std::chrono::steady_clock::now();
     auto result = std::make_unique<component>();
@@ -109,9 +117,7 @@ std::unique_ptr<component> open_component(const std::filesystem::path &path, ggm
     std::vector<char> scratch(8U * 1024U * 1024U);
     for (int64_t i = 0; i < gguf_get_n_tensors(result->file); ++i) {
         auto *tensor = ggml_get_tensor(result->ctx, gguf_get_tensor_name(result->file, i));
-        if (!tensor || (tensor->type != GGML_TYPE_BF16 && tensor->type != GGML_TYPE_F32 &&
-                        tensor->type != GGML_TYPE_Q8_0 && tensor->type != GGML_TYPE_Q6_K &&
-                        tensor->type != GGML_TYPE_Q5_K && tensor->type != GGML_TYPE_Q4_K))
+        if (!tensor || !valid_weight_type(tensor->type))
             throw std::runtime_error("invalid text tensor");
         const size_t bytes = ggml_nbytes(tensor);
         total_bytes += bytes;
@@ -130,6 +136,115 @@ std::unique_ptr<component> open_component(const std::filesystem::path &path, ggm
                      path.filename().string().c_str(),
                      static_cast<double>(total_bytes) / (1024.0 * 1024.0), profile_elapsed_ms(started));
     }
+    return result;
+}
+
+struct monolithic_bundle {
+    std::filesystem::path path;
+    gguf_context *file = nullptr;
+    ggml_context *catalog = nullptr;
+    std::ifstream stream;
+    std::unordered_map<std::string, std::int64_t> indices;
+    ~monolithic_bundle() {
+        if (file) gguf_free(file);
+        if (catalog) ggml_free(catalog);
+    }
+};
+
+std::unique_ptr<monolithic_bundle> open_monolithic(const std::filesystem::path &path) {
+    auto result = std::make_unique<monolithic_bundle>();
+    result->path = path;
+    gguf_init_params params{true, &result->catalog};
+    result->file = gguf_init_from_file(path.string().c_str(), params);
+    if (!result->file || !result->catalog)
+        throw std::runtime_error("cannot load monolithic text model " + path.string());
+    for (std::int64_t index = 0; index < gguf_get_n_tensors(result->file); ++index) {
+        const char *name = gguf_get_tensor_name(result->file, index);
+        auto *tensor = ggml_get_tensor(result->catalog, name);
+        if (!tensor || !valid_weight_type(tensor->type) ||
+            !result->indices.emplace(name, index).second)
+            throw std::runtime_error("invalid monolithic text tensor catalog");
+    }
+    if (!result->indices.contains("token_embedding.weight") ||
+        !result->indices.contains("final_norm.weight"))
+        throw std::runtime_error("monolithic text model lacks embedding or final norm");
+    for (int layer = 0; layer < 32; ++layer) {
+        std::array<char, 32> prefix{};
+        std::snprintf(prefix.data(), prefix.size(), "layer.%02d.", layer);
+        if (!result->indices.contains(std::string(prefix.data()) + "attn_norm.weight"))
+            throw std::runtime_error("monolithic text model lacks layer " + std::to_string(layer));
+    }
+    result->stream.open(path, std::ios::binary);
+    if (!result->stream) throw std::runtime_error("cannot reopen monolithic text model");
+    return result;
+}
+
+enum class component_kind { embedding, layer, final_norm };
+
+std::unique_ptr<component> open_component(monolithic_bundle &bundle,
+                                          ggml_backend_t backend,
+                                          component_kind kind, int layer = -1) {
+    const auto started = std::chrono::steady_clock::now();
+    std::string prefix;
+    if (kind == component_kind::layer) {
+        std::array<char, 32> value{};
+        std::snprintf(value.data(), value.size(), "layer.%02d.", layer);
+        prefix = value.data();
+    }
+    std::vector<std::pair<std::string, std::string>> selected;
+    if (kind == component_kind::embedding) {
+        selected.emplace_back("token_embedding.weight", "token_embedding.weight");
+    } else if (kind == component_kind::final_norm) {
+        selected.emplace_back("final_norm.weight", "final_norm.weight");
+    } else {
+        for (std::int64_t index = 0; index < gguf_get_n_tensors(bundle.file); ++index) {
+            const std::string full_name = gguf_get_tensor_name(bundle.file, index);
+            if (full_name.starts_with(prefix))
+                selected.emplace_back(full_name, full_name.substr(prefix.size()));
+        }
+    }
+    if (selected.empty()) throw std::runtime_error("monolithic text component is empty");
+
+    auto result = std::make_unique<component>();
+    result->ctx = ggml_init({4ULL*1024ULL*1024ULL, nullptr, true});
+    if (!result->ctx) throw std::runtime_error("cannot allocate text component metadata");
+    for (const auto &[full_name, short_name] : selected) {
+        auto *source = ggml_get_tensor(bundle.catalog, full_name.c_str());
+        if (!source) throw std::runtime_error("missing monolithic tensor " + full_name);
+        auto *tensor = ggml_dup_tensor(result->ctx, source);
+        ggml_set_name(tensor, short_name.c_str());
+    }
+    result->weights = ggml_backend_alloc_ctx_tensors(result->ctx, backend);
+    if (!result->weights) throw std::runtime_error("cannot allocate monolithic text component");
+
+    const auto data_offset = gguf_get_data_offset(bundle.file);
+    size_t total_bytes = 0;
+    std::vector<char> scratch(8U*1024U*1024U);
+    for (const auto &[full_name, short_name] : selected) {
+        auto *tensor = ggml_get_tensor(result->ctx, short_name.c_str());
+        const auto found = bundle.indices.find(full_name);
+        if (!tensor || found == bundle.indices.end())
+            throw std::runtime_error("invalid selected monolithic tensor");
+        const size_t bytes = ggml_nbytes(tensor);
+        total_bytes += bytes;
+        bundle.stream.clear();
+        bundle.stream.seekg(static_cast<std::streamoff>(
+            data_offset + gguf_get_tensor_offset(bundle.file, found->second)));
+        for (size_t done = 0; done < bytes;) {
+            const size_t count = std::min(scratch.size(), bytes-done);
+            bundle.stream.read(scratch.data(), static_cast<std::streamsize>(count));
+            if (!bundle.stream) throw std::runtime_error("truncated monolithic text tensor");
+            ggml_backend_tensor_set(tensor, scratch.data(), done, count);
+            done += count;
+        }
+    }
+    if (profile_enabled())
+        std::fprintf(stderr, "profile text.upload component=%s%s mib=%.2f ms=%.3f\n",
+                     kind == component_kind::layer ? "layer-" :
+                         kind == component_kind::embedding ? "embedding" : "final-norm",
+                     kind == component_kind::layer ? std::to_string(layer).c_str() : "",
+                     static_cast<double>(total_bytes)/(1024.0*1024.0),
+                     profile_elapsed_ms(started));
     return result;
 }
 
@@ -291,6 +406,7 @@ std::vector<float> run_layer_chunk(std::span<const std::unique_ptr<component>> l
 
 struct llm_text_encoder::impl {
     std::filesystem::path directory;
+    std::unique_ptr<monolithic_bundle> monolithic;
     std::unique_ptr<llm_tokenizer> tokenizer;
     ggml_backend_t backend = nullptr;
     int layer_chunk = 8;
@@ -298,17 +414,55 @@ struct llm_text_encoder::impl {
     std::vector<std::unique_ptr<component>> layers;
     std::unique_ptr<component> final_norm;
     mutable std::mutex encode_mutex;
-    ~impl() { if (backend) ggml_backend_free(backend); }
+    std::unique_ptr<component> load_embedding() {
+        if (monolithic)
+            return open_component(*monolithic, backend, component_kind::embedding);
+        return open_component(directory / "embedding.gguf", backend);
+    }
+    std::unique_ptr<component> load_layer(int layer) {
+        if (monolithic)
+            return open_component(*monolithic, backend, component_kind::layer, layer);
+        char name[32];
+        std::snprintf(name, sizeof(name), "layer-%02d.gguf", layer);
+        return open_component(directory / name, backend);
+    }
+    std::unique_ptr<component> load_final_norm() {
+        if (monolithic)
+            return open_component(*monolithic, backend, component_kind::final_norm);
+        return open_component(directory / "final-norm.gguf", backend);
+    }
+    ~impl() {
+        final_norm.reset();
+        layers.clear();
+        embedding.reset();
+        if (backend) ggml_backend_free(backend);
+    }
 };
 
 llm_text_encoder::~llm_text_encoder() = default;
 
-std::expected<std::unique_ptr<llm_text_encoder>, std::string> llm_text_encoder::load(std::string_view directory) try {
-    const auto path = std::filesystem::path(directory);
-    if (!std::filesystem::is_directory(path)) return std::unexpected("text model must be a component directory");
-    for (const auto &name : {"tokenizer.gguf", "embedding.gguf", "final-norm.gguf"})
-        if (!std::filesystem::is_regular_file(path / name)) return std::unexpected("text bundle missing " + std::string(name));
-    for (int i = 0; i < 32; ++i) { char name[32]; std::snprintf(name, sizeof(name), "layer-%02d.gguf", i); if (!std::filesystem::is_regular_file(path / name)) return std::unexpected("text bundle missing " + std::string(name)); }
+std::expected<std::unique_ptr<llm_text_encoder>, std::string> llm_text_encoder::load(std::string_view source) try {
+    const auto path = std::filesystem::path(source);
+    const bool component_bundle = std::filesystem::is_directory(path);
+    const bool monolithic = std::filesystem::is_regular_file(path) && path.extension() == ".gguf";
+    if (!component_bundle && !monolithic)
+        return std::unexpected("text model must be a component directory or monolithic GGUF");
+    const auto directory = component_bundle ? path :
+        (path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path());
+    const auto tokenizer_path = directory / "tokenizer.gguf";
+    if (!std::filesystem::is_regular_file(tokenizer_path))
+        return std::unexpected("text bundle missing tokenizer.gguf");
+    if (component_bundle) {
+        for (const auto &name : {"embedding.gguf", "final-norm.gguf"})
+            if (!std::filesystem::is_regular_file(path / name))
+                return std::unexpected("text bundle missing " + std::string(name));
+        for (int i = 0; i < 32; ++i) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "layer-%02d.gguf", i);
+            if (!std::filesystem::is_regular_file(path / name))
+                return std::unexpected("text bundle missing " + std::string(name));
+        }
+    }
     auto result = std::unique_ptr<llm_text_encoder>(new llm_text_encoder);
     result->impl_ = std::make_unique<impl>();
 #if defined(KIMODO_HAVE_GGML_VULKAN)
@@ -319,25 +473,27 @@ std::expected<std::unique_ptr<llm_text_encoder>, std::string> llm_text_encoder::
         if (!result->impl_->backend) return std::unexpected("cannot initialize text backend");
         ggml_backend_cpu_set_n_threads(result->impl_->backend, cpu_thread_count());
     }
-    auto tokenizer = llm_tokenizer::load((path / "tokenizer.gguf").string());
+    auto tokenizer = llm_tokenizer::load(tokenizer_path.string());
     if (!tokenizer) return std::unexpected(tokenizer.error());
-    result->impl_->directory = path;
+    result->impl_->directory = directory;
     result->impl_->tokenizer = std::move(*tokenizer);
     result->impl_->layer_chunk = layer_chunk_size();
     uintmax_t bundle_bytes = 0;
-    for (const auto &entry : std::filesystem::directory_iterator(path))
-        if (entry.is_regular_file() && entry.path().extension() == ".gguf")
-            bundle_bytes += entry.file_size();
+    if (component_bundle) {
+        for (const auto &entry : std::filesystem::directory_iterator(path))
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf")
+                bundle_bytes += entry.file_size();
+    } else {
+        result->impl_->monolithic = open_monolithic(path);
+        bundle_bytes = std::filesystem::file_size(path) + std::filesystem::file_size(tokenizer_path);
+    }
     if (result->impl_->layer_chunk == 32 && bundle_bytes <= resident_limit_bytes()) {
         const auto started = std::chrono::steady_clock::now();
-        result->impl_->embedding = open_component(path / "embedding.gguf", result->impl_->backend);
+        result->impl_->embedding = result->impl_->load_embedding();
         result->impl_->layers.reserve(32);
-        for (int i = 0; i < 32; ++i) {
-            char name[32];
-            std::snprintf(name, sizeof(name), "layer-%02d.gguf", i);
-            result->impl_->layers.push_back(open_component(path / name, result->impl_->backend));
-        }
-        result->impl_->final_norm = open_component(path / "final-norm.gguf", result->impl_->backend);
+        for (int i = 0; i < 32; ++i)
+            result->impl_->layers.push_back(result->impl_->load_layer(i));
+        result->impl_->final_norm = result->impl_->load_final_norm();
         if (profile_enabled())
             std::fprintf(stderr, "profile text.resident_load layers=32 ms=%.3f\n", profile_elapsed_ms(started));
     } else if (profile_enabled() && result->impl_->layer_chunk == 32) {
@@ -361,7 +517,7 @@ std::expected<std::array<float, 4096>, std::string> llm_text_encoder::encode(std
         std::unique_ptr<component> temporary;
         component *embedding = impl_->embedding.get();
         if (!embedding) {
-            temporary = open_component(impl_->directory / "embedding.gguf", impl_->backend);
+            temporary = impl_->load_embedding();
             embedding = temporary.get();
         }
         auto *weight = embedding->tensor("token_embedding.weight");
@@ -398,10 +554,8 @@ std::expected<std::array<float, 4096>, std::string> llm_text_encoder::encode(std
                 continue;
             }
             std::vector<std::unique_ptr<component>> layers;
-            for (int i = first; i < std::min(first + graph_chunk, 32); ++i) {
-                char name[32]; std::snprintf(name, sizeof(name), "layer-%02d.gguf", i);
-                layers.push_back(open_component(impl_->directory / name, impl_->backend));
-            }
+            for (int i = first; i < std::min(first + graph_chunk, 32); ++i)
+                layers.push_back(impl_->load_layer(i));
             state = run_layer_chunk(layers, state, impl_->backend);
         }
         layers_ms = profile_elapsed_ms(started);
@@ -410,7 +564,7 @@ std::expected<std::array<float, 4096>, std::string> llm_text_encoder::encode(std
     std::unique_ptr<component> temporary_final;
     component *final = impl_->final_norm.get();
     if (!final) {
-        temporary_final = open_component(impl_->directory / "final-norm.gguf", impl_->backend);
+        temporary_final = impl_->load_final_norm();
         final = temporary_final.get();
     }
     auto *weight = final->tensor("final_norm.weight");

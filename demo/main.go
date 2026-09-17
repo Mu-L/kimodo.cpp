@@ -440,18 +440,24 @@ func (g *gallery) worker() {
 }
 
 func main() {
+	preferPacked := func(packed, legacy string) string {
+		if info, err := os.Stat(packed); err == nil && info.Mode().IsRegular() {
+			return packed
+		}
+		return legacy
+	}
 	addr := flag.String("addr", "127.0.0.1:8090", "listen address")
 	motion := flag.String("motion-model", "models/kimodo-smplx-rp-v1-f32.gguf", "motion GGUF")
 	somaRP := flag.String("soma-rp-model", "models/kimodo-soma-rp-v1.1-f32.gguf", "SOMA RP v1.1 motion GGUF")
 	somaSEED := flag.String("soma-seed-model", "models/kimodo-soma-seed-v1.1-f32.gguf", "SOMA SEED v1.1 motion GGUF")
 	g1RP := flag.String("g1-rp-model", "models/kimodo-g1-rp-v1-f32.gguf", "G1 RP v1 motion GGUF")
 	g1SEED := flag.String("g1-seed-model", "models/kimodo-g1-seed-v1-f32.gguf", "G1 SEED v1 motion GGUF")
-	text := flag.String("text-bundle", "generated/llm2vec-text-bundle", "native LLM2Vec component directory")
-	textQ8 := flag.String("text-q8-bundle", "generated/llm2vec-text-q8_0", "Q8_0 LLM2Vec component directory")
-	textQ6 := flag.String("text-q6-bundle", "generated/llm2vec-text-q6_k", "Q6_K LLM2Vec component directory")
-	textQ5 := flag.String("text-q5-bundle", "generated/llm2vec-text-q5_k", "Q5_K LLM2Vec component directory")
-	textQ4 := flag.String("text-q4-bundle", "generated/llm2vec-text-q4_k", "Q4_K LLM2Vec component directory")
-	textQ4Mixed := flag.String("text-q4-mixed-bundle", "generated/llm2vec-text-q4_k_m", "mixed Q4_K LLM2Vec component directory")
+	text := flag.String("text-bundle", preferPacked("Llama-3-Kimodo-BF16.gguf", "generated/llm2vec-text-bundle"), "BF16 LLM2Vec GGUF or legacy component directory")
+	textQ8 := flag.String("text-q8-bundle", preferPacked("Llama-3-Kimodo-Q8_0.gguf", "generated/llm2vec-text-q8_0"), "Q8_0 LLM2Vec GGUF or legacy component directory")
+	textQ6 := flag.String("text-q6-bundle", preferPacked("Llama-3-Kimodo-Q6_K.gguf", "generated/llm2vec-text-q6_k"), "Q6_K LLM2Vec GGUF or legacy component directory")
+	textQ5 := flag.String("text-q5-bundle", preferPacked("Llama-3-Kimodo-Q5_K.gguf", "generated/llm2vec-text-q5_k"), "Q5_K LLM2Vec GGUF or legacy component directory")
+	textQ4 := flag.String("text-q4-bundle", preferPacked("Llama-3-Kimodo-Q4_K.gguf", "generated/llm2vec-text-q4_k"), "Q4_K LLM2Vec GGUF or legacy component directory")
+	textQ4Mixed := flag.String("text-q4-mixed-bundle", preferPacked("Llama-3-Kimodo-Q4_K_M.gguf", "generated/llm2vec-text-q4_k_m"), "mixed Q4_K LLM2Vec GGUF or legacy component directory")
 	generator := flag.String("generator", "build/debug/kmd-generate", "native text-to-motion command")
 	output := flag.String("output", "demo-output", "persistent gallery directory")
 	comparisons := flag.String("comparisons", "quantization-comparisons", "viewer-ready quantization comparison directories")
@@ -481,13 +487,26 @@ func main() {
 	makeTextBundle := func(id, label, description, path string) textBundle {
 		bundle := textBundle{ID: id, Label: label, Description: description, Path: path}
 		info, err := os.Stat(path)
-		if err != nil || !info.IsDir() {
+		if err != nil {
 			bundle.Reason = "bundle not found at " + path
 			return bundle
 		}
-		components, err := filepath.Glob(filepath.Join(path, "*.gguf"))
-		if err != nil || len(components) == 0 {
-			bundle.Reason = "bundle contains no GGUF components"
+		components := []string{path}
+		if info.IsDir() {
+			components, err = filepath.Glob(filepath.Join(path, "*.gguf"))
+			if err != nil || len(components) == 0 {
+				bundle.Reason = "bundle contains no GGUF components"
+				return bundle
+			}
+		} else if info.Mode().IsRegular() && filepath.Ext(path) == ".gguf" {
+			tokenizer := filepath.Join(filepath.Dir(path), "tokenizer.gguf")
+			if tokenizerInfo, statErr := os.Stat(tokenizer); statErr != nil || !tokenizerInfo.Mode().IsRegular() {
+				bundle.Reason = "tokenizer.gguf not found beside " + path
+				return bundle
+			}
+			components = append(components, tokenizer)
+		} else {
+			bundle.Reason = "text model is not a GGUF or component directory"
 			return bundle
 		}
 		for _, component := range components {

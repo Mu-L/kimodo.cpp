@@ -30,7 +30,9 @@ def verify_file(file_path: Path, expected_bytes: int, expected_sha256: str):
     if h.hexdigest() != expected_sha256:
         raise SystemExit(f"Checksum mismatch for {file_path}")
 
-def download_and_verify(repo: str, revision: str, output_dir: Path, patterns: list[str]):
+def download_and_verify(repo: str, revision: str, output_dir: Path,
+                        patterns: list[str] | None = None,
+                        text_quantization: str | None = None):
     manifest_local = hf_hub_download(
         repo_id=repo,
         filename="MANIFEST.json",
@@ -40,7 +42,18 @@ def download_and_verify(repo: str, revision: str, output_dir: Path, patterns: li
     manifest = json.loads(Path(manifest_local).read_text(encoding="utf-8"))
     if manifest.get("format") != "kimodo-gguf-manifest-v1":
         raise SystemExit(f"Unsupported or malformed manifest in {repo}")
+    if text_quantization is not None:
+        variant = manifest.get("variants", {}).get(text_quantization)
+        if not isinstance(variant, dict):
+            raise SystemExit(f"Text quantization {text_quantization!r} is not published by {repo}")
+        weights, tokenizer = variant.get("weights"), variant.get("tokenizer")
+        if not isinstance(weights, str) or not isinstance(tokenizer, str):
+            raise SystemExit(f"Malformed {text_quantization!r} variant in {repo}")
+        patterns = [weights, tokenizer]
+    if not patterns:
+        raise SystemExit("No GGUF paths were selected")
 
+    matched = set()
     for entry in manifest.get("files", []):
         rel_path = entry.get("path", "")
         p = Path(rel_path)
@@ -60,6 +73,7 @@ def download_and_verify(repo: str, revision: str, output_dir: Path, patterns: li
         
         if not matches:
             continue
+        matched.add(rel_path)
 
         print(f"Downloading {rel_path} from {repo}...")
         downloaded = hf_hub_download(
@@ -70,6 +84,9 @@ def download_and_verify(repo: str, revision: str, output_dir: Path, patterns: li
         )
         print(f"Verifying {rel_path}...")
         verify_file(Path(downloaded), entry.get("bytes"), entry.get("sha256"))
+    missing = set(patterns) - matched
+    if missing:
+        raise SystemExit(f"Selected paths absent from {repo} manifest: {', '.join(sorted(missing))}")
 
 def main():
     parser = argparse.ArgumentParser(description="Download kimodo.cpp GGUF weights")
@@ -78,6 +95,9 @@ def main():
     parser.add_argument("--motion-repo", help="Override motion repo")
     parser.add_argument("--text-repo", default=TEXT_REPO_DEFAULT, help="Text encoder repo")
     parser.add_argument("--revision", default="main", help="Git revision")
+    parser.add_argument("--text-quantization",
+                        choices=("bf16", "q8_0", "q6_k", "q5_k", "q4_k", "q4_k_m"),
+                        default="q8_0", help="Text encoder variant (default: q8_0)")
     parser.add_argument("--motion-only", action="store_true", help="Download only motion weights, skip text bundle")
     args = parser.parse_args()
 
@@ -92,8 +112,9 @@ def main():
         download_and_verify(repo, args.revision, output_path, [default_file])
 
     if not args.motion_only:
-        print(f"--- Downloading Text Encoder Bundle ({args.text_repo}) ---")
-        download_and_verify(args.text_repo, args.revision, output_path, ["generated/llm2vec-text-bundle/*"])
+        print(f"--- Downloading Text Encoder {args.text_quantization} ({args.text_repo}) ---")
+        download_and_verify(args.text_repo, args.revision, output_path,
+                            text_quantization=args.text_quantization)
 
     print("\nAll requested Kimodo GGUF models downloaded and verified successfully!")
 

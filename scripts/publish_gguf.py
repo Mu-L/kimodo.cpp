@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import json
 import sys
 from pathlib import Path
@@ -70,6 +69,14 @@ TEXT_NAMES = (
     "tokenizer.gguf", "embedding.gguf", "final-norm.gguf",
     *(f"layer-{index:02d}.gguf" for index in range(32)),
 )
+TEXT_VARIANTS = {
+    "bf16": "Llama-3-Kimodo-BF16.gguf",
+    "q8_0": "Llama-3-Kimodo-Q8_0.gguf",
+    "q6_k": "Llama-3-Kimodo-Q6_K.gguf",
+    "q5_k": "Llama-3-Kimodo-Q5_K.gguf",
+    "q4_k": "Llama-3-Kimodo-Q4_K.gguf",
+    "q4_k_m": "Llama-3-Kimodo-Q4_K_M.gguf",
+}
 SOURCE_REVISIONS = {
     "meta-llama/Meta-Llama-3-8B-Instruct": "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
     "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp": "31474e395ada192e8ed1586db6be79fb3b70c9c0",
@@ -99,12 +106,18 @@ def require_revision(repo: str, expected: str, folder: str | None = None) -> Non
         raise ValueError(f"unexpected {repo} revision: {actual} (expected {expected})")
 
 
-def artifacts(component: str, motion: Path, motion_name: str, bundle: Path) -> list[tuple[Path, str]]:
+def artifacts(component: str, motion: Path, motion_name: str, bundle: Path,
+              packed: Path) -> list[tuple[Path, str]]:
     result: list[tuple[Path, str]] = []
     if component == "motion":
         result.append((motion, f"models/{motion_name}"))
     else:
+        # Keep the original BF16 component tree for old downloaders during the
+        # migration. New clients select one monolithic weight file and share a
+        # single tokenizer across every quantization.
         result.extend((bundle / name, f"generated/llm2vec-text-bundle/{name}") for name in TEXT_NAMES)
+        result.append((bundle / "tokenizer.gguf", "tokenizer.gguf"))
+        result.extend((packed / filename, filename) for filename in TEXT_VARIANTS.values())
     for source, destination in result:
         if not source.is_file() or source.stat().st_size == 0:
             raise ValueError(f"missing or empty GGUF: {source}")
@@ -125,6 +138,9 @@ def main() -> int:
     parser.add_argument("--motion-model", choices=tuple(MOTION_MODELS), default="soma-rp-v1.1")
     parser.add_argument("--text-bundle", type=Path,
                         default=ROOT / "generated/llm2vec-text-bundle")
+    parser.add_argument("--text-packed-dir", type=Path,
+                        default=ROOT / "generated/llm2vec-text-packed",
+                        help="directory containing monolithic text-encoder variants")
     parser.add_argument("--component", choices=("text", "motion"), required=True,
                         help="which independently licensed distribution to publish")
     parser.add_argument("--repo", default=None, help="override the component's HF repository")
@@ -154,7 +170,8 @@ def main() -> int:
         for source_repo, revision in relevant_sources.items():
             folder = motion_spec["folder"] if args.component == "motion" else None
             require_revision(source_repo, revision, folder)
-        files = artifacts(args.component, motion, motion_spec["file"], args.text_bundle)
+        files = artifacts(args.component, motion, motion_spec["file"],
+                          args.text_bundle, args.text_packed_dir)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
@@ -169,6 +186,12 @@ def main() -> int:
         "source_revisions": relevant_sources,
         "files": entries,
     }
+    if args.component == "text":
+        manifest["variants"] = {
+            quantization: {"weights": filename, "tokenizer": "tokenizer.gguf"}
+            for quantization, filename in TEXT_VARIANTS.items()
+        }
+        manifest["default_variant"] = "q8_0"
     sums = "".join(f"{entry['sha256']}  {entry['path']}\n" for entry in entries)
     total = sum(entry["bytes"] for entry in entries)
 
@@ -183,23 +206,49 @@ def main() -> int:
         print("error: --upload requires --confirm-upstream-licences", file=sys.stderr)
         return 2
 
-    from huggingface_hub import HfApi
+    from huggingface_hub import CommitOperationAdd, HfApi
     api = HfApi()
     api.create_repo(repo, repo_type="model", exist_ok=True)
+    remote_paths = set(api.list_repo_files(repo_id=repo, repo_type="model"))
+    legacy_prefix = "generated/llm2vec-text-bundle/"
+    legacy_files = [(source, destination) for source, destination in files
+                    if destination.startswith(legacy_prefix)]
+    missing_legacy = [destination for _, destination in legacy_files
+                      if destination not in remote_paths]
+    release_files = files
+    if args.component == "text" and not missing_legacy:
+        # The existing public repository already contains this compatibility
+        # tree. Keep it in MANIFEST.json, but avoid needlessly rehashing and
+        # pre-uploading 35 unchanged paths on every quantization release.
+        release_files = [(source, destination) for source, destination in files
+                         if not destination.startswith(legacy_prefix)]
     uploads = [(card, "README.md"), (notice, "NOTICE")]
     if args.component == "text":
         uploads.append((LLAMA_LICENSE, "LICENSE-META-LLAMA-3.txt"))
-    for source, destination in uploads + files:
+    # Large multi-file create_commit calls prepare every Xet upload in
+    # parallel and can exhaust host RAM for the complete text release. Upload
+    # one model artifact at a time; each operation is resumable and bounded.
+    # Publish the manifest last so clients never observe a variant before its
+    # weights and tokenizer exist.
+    for source, destination in release_files:
         print(f"uploading {destination} ...", flush=True)
         api.upload_file(path_or_fileobj=str(source), path_in_repo=destination,
                         repo_id=repo, repo_type="model",
                         commit_message=f"Add {destination}")
-    for payload, destination in ((json.dumps(manifest, indent=2, sort_keys=True).encode() + b"\n", "MANIFEST.json"),
-                                 (sums.encode(), "SHA256SUMS")):
-        print(f"uploading {destination} ...", flush=True)
-        api.upload_file(path_or_fileobj=io.BytesIO(payload), path_in_repo=destination,
-                        repo_id=repo, repo_type="model",
-                        commit_message=f"Add {destination}")
+    operations = [
+        CommitOperationAdd(path_in_repo=destination, path_or_fileobj=str(source))
+        for source, destination in uploads
+    ]
+    operations.extend((
+        CommitOperationAdd(
+            path_in_repo="MANIFEST.json",
+            path_or_fileobj=json.dumps(manifest, indent=2, sort_keys=True).encode() + b"\n"),
+        CommitOperationAdd(path_in_repo="SHA256SUMS", path_or_fileobj=sums.encode()),
+    ))
+    print(f"publishing {len(operations)} metadata files in one commit ...", flush=True)
+    api.create_commit(repo_id=repo, repo_type="model", operations=operations,
+                      commit_message="Add monolithic text quantizations" if args.component == "text"
+                      else f"Publish {args.motion_model} GGUF")
     print(f"done -> https://huggingface.co/{repo}")
     return 0
 

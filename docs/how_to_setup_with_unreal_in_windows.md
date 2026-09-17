@@ -53,16 +53,16 @@ This will generate:
 
 ## 4. Download Model Weights
 
-Download the **SOMA motion model** and the **Llama-3 text encoder bundle** using the Python downloader script:
+Download the **SOMA motion model** and recommended **Q8_0 Llama-3 text encoder** using the Python downloader script:
 
 ```powershell
-# Downloads SOMA RP v1.1 motion model and Llama-3 text encoder (~8 GB total)
+# Add --text-quantization bf16 (or q6_k, q5_k, q4_k, q4_k_m) to choose another encoder.
 python scripts/download_gguf_weights.py --model soma-rp-v1.1
 ```
 
 Files will be placed in:
 - `models/kimodo-soma-rp-v1.1-f32.gguf` (Motion checkpoint)
-- `generated/llm2vec-text-bundle/` (Text encoder layers, tokenizer, embedding)
+- `Llama-3-Kimodo-Q8_0.gguf` and `tokenizer.gguf` (Text encoder)
 
 ---
 
@@ -83,7 +83,7 @@ $env:PATH = "E:\Kimodo\build\bin\Release;E:\Kimodo\build\Release;" + $env:PATH
 
 ### Step C: Run Motion Generation
 ```powershell
-.\build\Release\kmd-generate.exe models\kimodo-soma-rp-v1.1-f32.gguf generated\llm2vec-text-bundle prompt.txt 120 50 42 output_motion\
+.\build\Release\kmd-generate.exe models\kimodo-soma-rp-v1.1-f32.gguf Llama-3-Kimodo-Q8_0.gguf prompt.txt 120 50 42 output_motion\
 ```
 > **Parameters:**
 > - `120`: Frame count (~4 seconds at 30 FPS).
