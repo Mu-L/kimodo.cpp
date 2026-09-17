@@ -12,9 +12,10 @@ SEED sample. Times vary with clocks and shader-cache state.
 
 | Path | Before | Current | Change |
 | --- | ---: | ---: | ---: |
-| Repeated Q8 text encode | 1,253 ms | 67 ms isolated; 75 ms beside resident motion weights | about 17–19x faster |
-| 60-frame motion diffusion step | 67.3 ms | 50.9 ms | 24% faster |
-| Motion graph calls per step | 36 | 12 | 3x fewer |
+| Repeated Q8 text encode (isolated) | 1,253 ms | 60 ms | about 21x faster |
+| 8-frame motion diffusion step | 53.7 ms | 25.5 ms | 53% faster |
+| 150-frame, 100-step motion sample | 14.49 s | 4.96 s | 2.92x faster |
+| Motion graph calls per step | 36 | 8 | 4.5x fewer |
 
 The Q8 encoder's one-time upload takes about 1.1–1.2 seconds. The live worker
 keeps that encoder and the selected motion checkpoint in VRAM, so requests
@@ -35,8 +36,11 @@ For a warm Q8 text encode, Vulkan timestamps reported about 49 ms of GPU work.
 The main quantized FFN projections dominate. The rank-16 F32 LoRA down
 projections are the next largest group and run at low utilization because of
 their narrow shape. Sharing the attention normalization for Q, K, and V removes
-two redundant RMS-normalization subgraphs per layer without changing output
-bytes.
+two redundant RMS-normalization subgraphs per layer. Packing the Q/K/V LoRA A
+projections into one rank-48 multiplication, and gate/up into one rank-32
+multiplication, reduces a warm isolated encode from about 63.7 ms to 60.0 ms.
+The resulting embedding is byte-identical. Set `KIMODO_TEXT_PACKED_LORA=0` to
+select the reference graph.
 
 Before motion-layer grouping, one 60-frame diffusion step spent approximately:
 
@@ -45,25 +49,36 @@ Before motion-layer grouping, one 60-frame diffusion step spent approximately:
 - 3.4 ms uploading inputs
 - 5.2 ms downloading intermediate outputs
 
-Executing four transformer layers per graph removes most intermediate host
-round-trips and allocator calls. Output is byte-identical to the one-layer
-graph path; set `KIMODO_MOTION_LAYER_CHUNK=1` to reproduce that baseline or use
-the default value of 4.
+Packed four-dimensional attention replaces the per-head branches, removing
+most of their small launches and materializations. Executing eight transformer
+layers per graph then reduces each root or body transformer to two layer
+graphs. The compute allocator and its scratch buffer are retained with the
+resident motion weights instead of being recreated for every graph. Set
+`KIMODO_MOTION_PACKED_ATTENTION=0` and `KIMODO_MOTION_LAYER_CHUNK=1` to select
+the reference layout and grouping.
 
-GGML's per-operation motion trace identifies the next optimization targets:
+The packed path was compared against that reference for an 8-frame step and a
+150-frame, 100-step in-distribution sample. The sampled state, root positions,
+and local rotations were byte-identical. The longer sample fell from 14.49 to
+4.96 seconds. Layer groups of 16 were also tested but regressed slightly, so
+eight is the default.
 
-1. Packed attention. The parity-first graph launches 768 small QK products and
-   768 small value products per diffusion step, plus 3,074 `CONT` operations.
-   A packed layout should remove much of this launch and materialization cost,
-   but its numerical motion divergence must be measured before becoming the
-   default.
-2. Reusable graph allocations. Twelve graphs are still built and allocated on
-   every diffusion step. Shape-keyed graph/buffer caching can remove much of
-   the remaining allocator overhead.
-3. Larger motion graph groups. More than four layers needs a larger GGML graph
-   capacity and activation-memory measurements; four is the validated default.
-4. LoRA fusion for the text encoder. Fusing the rank-16 update with each base
-   projection would target the remaining narrow F32 matrix multiplications.
+The next optimization targets are:
+
+1. Shape-keyed graph caching. The allocator and buffer are now reused, but the
+   eight graph topologies are still rebuilt and reserved on every diffusion
+   step. Cached contexts/graphs could remove that remaining CPU and allocation
+   overhead.
+2. Text LoRA kernel fusion. Packing reduces the number of narrow A projections,
+   but the LoRA B result is still a separate F32 matrix multiplication and add
+   for every base projection. A fused Vulkan operation would avoid those
+   intermediate tensors.
+3. Conversion-time packing. The LoRA A tensors are concatenated while each
+   execution graph is built. Storing prepacked QKV and gate/up tensors in the
+   bundle would reduce graph construction and metadata work.
+4. Caller-controlled request batching. Independent prompts with matching
+   shapes can share GPU launches when the caller can guarantee a full batch;
+   this trades latency and activation memory for throughput.
 
 For repeatable text measurements, `kmd-encode` accepts an optional repetition
 count and reports every iteration:

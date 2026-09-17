@@ -13,6 +13,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
 #include <random>
 
 namespace kimodo {
@@ -23,6 +24,7 @@ struct model::impl {
 #ifdef KIMODO_HAVE_GGML
     mutable std::unique_ptr<detail::ggml_motion_weights> weights;
     std::unique_ptr<detail::llm_text_encoder> text;
+    mutable std::mutex inference_mutex;
 #endif
 };
 model::model(std::unique_ptr<impl> state) : impl_(std::move(state)) {}
@@ -70,6 +72,7 @@ std::expected<motion_data, std::string> model::generate_embedding(
     if (!std::isfinite(text_cfg) || !std::isfinite(constraint_cfg)) return std::unexpected("CFG weights must be finite");
     for (float value : embedding) if (!std::isfinite(value)) return std::unexpected("embedding contains a non-finite value");
 #ifdef KIMODO_HAVE_GGML
+    const std::lock_guard inference_lock(impl_->inference_mutex);
     const auto generate_started = std::chrono::steady_clock::now();
     // Weight residency is deferred until inference so model-load stays a
     // bounded metadata operation.  The graph integration consumes this exact
@@ -133,6 +136,7 @@ std::expected<motion_data, std::string> model::generate_text_sequence(
         if (!embedding) return std::unexpected(embedding.error());
         embeddings.push_back(*embedding);
     }
+    const std::lock_guard inference_lock(impl_->inference_mutex);
     // Initialize and warm the quantized text backend before the F32 motion
     // backend applies its process-wide Vulkan parity flags. This preserves
     // cooperative-matrix text kernels in persistent sequence workers.

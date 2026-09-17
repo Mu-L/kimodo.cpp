@@ -92,6 +92,8 @@ std::expected<std::unique_ptr<ggml_motion_weights>, std::string> ggml_motion_wei
     }
     result->buffer_ = ggml_backend_alloc_ctx_tensors(result->context_, result->backend_);
     if (!result->buffer_) return std::unexpected("GGML motion weight allocation failed");
+    result->allocator_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(result->backend_));
+    if (!result->allocator_) return std::unexpected("GGML motion compute allocator creation failed");
     const double allocation_ms = profile_elapsed_ms(load_started);
     std::ifstream input(std::string(path), std::ios::binary);
     if (!input) return std::unexpected("cannot reopen motion GGUF");
@@ -117,6 +119,7 @@ std::expected<std::unique_ptr<ggml_motion_weights>, std::string> ggml_motion_wei
     return result;
 }
 ggml_motion_weights::~ggml_motion_weights() {
+    if (allocator_) ggml_gallocr_free(allocator_);
     if (buffer_) ggml_backend_buffer_free(buffer_);
     if (gguf_) gguf_free(gguf_);
     if (context_) ggml_free(context_);

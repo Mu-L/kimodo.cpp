@@ -62,6 +62,11 @@ uintmax_t resident_limit_bytes() {
     return parsed * 1024U * 1024U;
 }
 
+bool packed_lora_enabled() noexcept {
+    const char *value = std::getenv("KIMODO_TEXT_PACKED_LORA");
+    return !value || std::string_view(value) != "0";
+}
+
 int cpu_thread_count() noexcept {
     unsigned threads = std::max(1U, std::thread::hardware_concurrency());
     if (const char *value = std::getenv("KIMODO_THREADS")) {
@@ -178,14 +183,37 @@ ggml_tensor *layer_graph(ggml_context *ctx, ggml_tensor *x, ggml_tensor *positio
         // F32 cast preserves the BF16 values while taking its supported path.
         return ggml_mul_mat(ctx, weight, value->type == GGML_TYPE_F32 ? value : ggml_cast(ctx, value, GGML_TYPE_F32));
     };
+    auto project_lora = [&](const char *name, ggml_tensor *value, ggml_tensor *low_rank) {
+        const std::string prefix(name);
+        auto *b = model.tensor((prefix + "_lora_b.weight").c_str());
+        if (!b) throw std::runtime_error("missing LoRA projection");
+        auto *lora = ggml_mul_mat(ctx, b, low_rank);
+        return ggml_add(ctx, ggml_cast(ctx, base(name, value), GGML_TYPE_F32), ggml_scale(ctx, lora, 2.F));
+    };
     auto linear = [&](const char *name, ggml_tensor *value) {
         const std::string prefix(name);
         auto *a = model.tensor((prefix + "_lora_a.weight").c_str());
-        auto *b = model.tensor((prefix + "_lora_b.weight").c_str());
-        if (!a || !b) throw std::runtime_error("missing LoRA projection");
-        auto *lora = ggml_mul_mat(ctx, b, ggml_mul_mat(ctx, a,
-            value->type == GGML_TYPE_F32 ? value : ggml_cast(ctx, value, GGML_TYPE_F32)));
-        return ggml_add(ctx, ggml_cast(ctx, base(name, value), GGML_TYPE_F32), ggml_scale(ctx, lora, 2.F));
+        if (!a) throw std::runtime_error("missing LoRA projection");
+        auto *low_rank = ggml_mul_mat(ctx, a,
+            value->type == GGML_TYPE_F32 ? value : ggml_cast(ctx, value, GGML_TYPE_F32));
+        return project_lora(name, value, low_rank);
+    };
+    auto low_rank_view = [&](ggml_tensor *packed, int index) {
+        return ggml_view_2d(ctx, packed, 16, seq, packed->nb[1],
+                            static_cast<size_t>(index * 16) * sizeof(float));
+    };
+    auto packed_low_rank = [&](const char *first, const char *second,
+                               const char *third, ggml_tensor *value) {
+        auto lora_a = [&](const char *name) {
+            const std::string prefix(name);
+            auto *tensor = model.tensor((prefix + "_lora_a.weight").c_str());
+            if (!tensor) throw std::runtime_error("missing LoRA projection");
+            return tensor;
+        };
+        auto *joined = ggml_concat(ctx, lora_a(first), lora_a(second), 1);
+        if (third) joined = ggml_concat(ctx, joined, lora_a(third), 1);
+        return ggml_mul_mat(ctx, joined,
+            value->type == GGML_TYPE_F32 ? value : ggml_cast(ctx, value, GGML_TYPE_F32));
     };
     auto *attn_norm = model.tensor("attn_norm.weight");
     auto *ffn_norm = model.tensor("ffn_norm.weight");
@@ -194,9 +222,17 @@ ggml_tensor *layer_graph(ggml_context *ctx, ggml_tensor *x, ggml_tensor *positio
     // Q, K, and V consume the same normalized state. Building that subgraph
     // once avoids two redundant RMS norms plus their casts and scale ops.
     auto *attn_input = norm(ctx, residual, attn_norm);
-    auto *q = linear("attn_q_proj", attn_input);
-    auto *k = linear("attn_k_proj", attn_input);
-    auto *v = linear("attn_v_proj", attn_input);
+    ggml_tensor *q, *k, *v;
+    if (packed_lora_enabled()) {
+        auto *low_rank = packed_low_rank("attn_q_proj", "attn_k_proj", "attn_v_proj", attn_input);
+        q = project_lora("attn_q_proj", attn_input, low_rank_view(low_rank, 0));
+        k = project_lora("attn_k_proj", attn_input, low_rank_view(low_rank, 1));
+        v = project_lora("attn_v_proj", attn_input, low_rank_view(low_rank, 2));
+    } else {
+        q = linear("attn_q_proj", attn_input);
+        k = linear("attn_k_proj", attn_input);
+        v = linear("attn_v_proj", attn_input);
+    }
     q = ggml_reshape_3d(ctx, q, head_dim, heads, seq);
     k = ggml_reshape_3d(ctx, k, head_dim, kv_heads, seq);
     v = ggml_reshape_3d(ctx, v, head_dim, kv_heads, seq);
@@ -213,8 +249,16 @@ ggml_tensor *layer_graph(ggml_context *ctx, ggml_tensor *x, ggml_tensor *positio
     auto *output = ggml_add(ctx, ggml_cast(ctx, residual, GGML_TYPE_F32),
         linear("attn_o_proj", ggml_reshape_2d(ctx, attention, hidden, seq)));
     auto *hidden_norm = norm(ctx, output, ffn_norm);
-    auto *gate = ggml_silu(ctx, linear("ffn_gate_proj", hidden_norm));
-    output = ggml_add(ctx, output, linear("ffn_down_proj", ggml_mul(ctx, gate, linear("ffn_up_proj", hidden_norm))));
+    ggml_tensor *gate, *up;
+    if (packed_lora_enabled()) {
+        auto *low_rank = packed_low_rank("ffn_gate_proj", "ffn_up_proj", nullptr, hidden_norm);
+        gate = ggml_silu(ctx, project_lora("ffn_gate_proj", hidden_norm, low_rank_view(low_rank, 0)));
+        up = project_lora("ffn_up_proj", hidden_norm, low_rank_view(low_rank, 1));
+    } else {
+        gate = ggml_silu(ctx, linear("ffn_gate_proj", hidden_norm));
+        up = linear("ffn_up_proj", hidden_norm);
+    }
+    output = ggml_add(ctx, output, linear("ffn_down_proj", ggml_mul(ctx, gate, up)));
     return output;
 }
 
