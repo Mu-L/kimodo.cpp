@@ -1,9 +1,11 @@
 #include "ggml_weights.hpp"
 #include "gguf.hpp"
+#include "profile.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <thread>
@@ -57,6 +59,7 @@ int cpu_thread_count() noexcept {
 } // namespace
 
 std::expected<std::unique_ptr<ggml_motion_weights>, std::string> ggml_motion_weights::load(std::string_view path) {
+    const auto load_started = std::chrono::steady_clock::now();
     auto checked = read_gguf_header(path);
     if (!checked) return std::unexpected(checked.error());
     if (auto valid = validate_motion_gguf(*checked); !valid) return std::unexpected(valid.error());
@@ -89,6 +92,7 @@ std::expected<std::unique_ptr<ggml_motion_weights>, std::string> ggml_motion_wei
     }
     result->buffer_ = ggml_backend_alloc_ctx_tensors(result->context_, result->backend_);
     if (!result->buffer_) return std::unexpected("GGML motion weight allocation failed");
+    const double allocation_ms = profile_elapsed_ms(load_started);
     std::ifstream input(std::string(path), std::ios::binary);
     if (!input) return std::unexpected("cannot reopen motion GGUF");
     const size_t data_start = gguf_get_data_offset(result->gguf_);
@@ -104,6 +108,11 @@ std::expected<std::unique_ptr<ggml_motion_weights>, std::string> ggml_motion_wei
             if (!input) return std::unexpected("short tensor data in motion GGUF");
             ggml_backend_tensor_set(tensor, scratch.data(), done, chunk); done+=chunk;
         }
+    }
+    if (profile_enabled()) {
+        std::fprintf(stderr, "profile motion.weights allocation_ms=%.3f upload_ms=%.3f total_ms=%.3f\n",
+                     allocation_ms, profile_elapsed_ms(load_started) - allocation_ms,
+                     profile_elapsed_ms(load_started));
     }
     return result;
 }

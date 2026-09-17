@@ -2,8 +2,13 @@
 #include "ggml_weights.hpp"
 #include "motion_rep.hpp"
 #include "diffusion.hpp"
+#include "profile.hpp"
 
+#include <chrono>
+#include <cerrno>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <ggml.h>
@@ -14,6 +19,29 @@ namespace kimodo::detail {
 namespace {
 constexpr int width=1024, heads=8, head_width=128, text_tokens=50, prefix_tokens=52;
 thread_local std::vector<std::pair<ggml_tensor *, std::vector<float>>> inputs;
+struct execution_profile {
+    unsigned calls = 0;
+    double graph_ms = 0, allocation_ms = 0, upload_ms = 0, compute_ms = 0, download_ms = 0;
+};
+thread_local execution_profile *active_profile = nullptr;
+struct active_profile_guard {
+    execution_profile *previous;
+    explicit active_profile_guard(execution_profile *current) : previous(active_profile) {
+        active_profile = current;
+    }
+    ~active_profile_guard() { active_profile = previous; }
+};
+int motion_layer_chunk_size() noexcept {
+    constexpr int fallback = 4;
+    const char *value = std::getenv("KIMODO_MOTION_LAYER_CHUNK");
+    if (!value) return fallback;
+    char *end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 1 || parsed > 4)
+        return fallback;
+    return static_cast<int>(parsed);
+}
 ggml_tensor *input(ggml_context *ctx, std::span<const float> values, int a, int b, int c) {
     auto *r=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,a,b,c); inputs.emplace_back(r, std::vector<float>(values.begin(),values.end())); return r;
 }
@@ -29,13 +57,24 @@ ggml_tensor *norm(ggml_context *ctx, ggml_tensor *x, ggml_tensor *scale, ggml_te
     auto *n=ggml_norm(ctx,x,1.e-5f); return ggml_add(ctx,ggml_mul(ctx,n,ggml_repeat(ctx,scale,n)),ggml_repeat(ctx,bias,n));
 }
 std::expected<std::vector<float>,std::string> execute(ggml_context *ctx, ggml_tensor *out, size_t values, ggml_backend_t backend) {
+    auto started = std::chrono::steady_clock::now();
     auto *graph=ggml_new_graph(ctx); ggml_build_forward_expand(graph,out);
+    if (active_profile) { active_profile->calls++; active_profile->graph_ms += profile_elapsed_ms(started); }
+    started = std::chrono::steady_clock::now();
     auto alloc=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if(!alloc || !ggml_gallocr_reserve(alloc,graph) || !ggml_gallocr_alloc_graph(alloc,graph)) return std::unexpected("GGML graph allocation failed");
+    if (active_profile) active_profile->allocation_ms += profile_elapsed_ms(started);
+    started = std::chrono::steady_clock::now();
     for(const auto &[t,data]:inputs) ggml_backend_tensor_set(t,data.data(),0,data.size()*sizeof(float));
     inputs.clear();
+    if (active_profile) active_profile->upload_ms += profile_elapsed_ms(started);
+    started = std::chrono::steady_clock::now();
     if(ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) { ggml_gallocr_free(alloc); return std::unexpected("GGML graph execution failed"); }
-    std::vector<float> r(values); ggml_backend_tensor_get(out,r.data(),0,r.size()*sizeof(float)); ggml_gallocr_free(alloc); return r;
+    if (active_profile) active_profile->compute_ms += profile_elapsed_ms(started);
+    started = std::chrono::steady_clock::now();
+    std::vector<float> r(values); ggml_backend_tensor_get(out,r.data(),0,r.size()*sizeof(float));
+    if (active_profile) active_profile->download_ms += profile_elapsed_ms(started);
+    ggml_gallocr_free(alloc); return r;
 }
 ggml_tensor *weight(const ggml_motion_weights&w,std::string_view n) { auto*t=w.tensor(n); if(!t) throw std::runtime_error("missing GGML tensor: "+std::string(n)); return t; }
 ggml_tensor *layer(ggml_context *ctx,ggml_tensor*x,const ggml_motion_weights&w,std::string_view p,int seq,int batch) {
@@ -76,14 +115,36 @@ std::expected<std::vector<float>, std::string> run_separated_cfg_denoiser_condit
     const ggml_motion_weights &, std::span<const float>, std::span<const float>,
     std::span<const float>, std::span<const float>, float, float, float, float, std::size_t);
 std::expected<std::vector<float>, std::string> run_motion_transformer(const ggml_motion_weights&w,std::string_view prefix,std::span<const float> motion,size_t motion_dim,std::span<const float> embedding,std::span<const float> timesteps,std::span<const float> headings,size_t batch,size_t frames) try {
+    const auto profile_started = std::chrono::steady_clock::now();
+    execution_profile profile;
+    active_profile_guard profile_guard(profile_enabled() ? &profile : nullptr);
     if(!batch||!frames||motion.size()!=batch*frames*motion_dim||embedding.size()!=batch*4096||timesteps.size()!=batch||headings.size()!=batch) return std::unexpected("invalid Transformer input dimensions");
     const int seq=prefix_tokens+static_cast<int>(frames); std::vector<float> text(batch*text_tokens*4096),time(batch*width),angle(batch*2),position(size_t(seq)*width);
     for(size_t b=0;b<batch;++b) { std::memcpy(text.data()+b*text_tokens*4096,embedding.data()+b*4096,4096*sizeof(float)); for(int d=0;d<width;d+=2){float z=timesteps[b]*std::pow(10000.f,-float(d)/width);time[b*width+d]=std::sin(z);time[b*width+d+1]=std::cos(z);} angle[2*b]=std::cos(headings[b]);angle[2*b+1]=std::sin(headings[b]); }
     for(int s=0;s<seq;++s)for(int d=0;d<width;d+=2){float z=float(s)*std::pow(10000.f,-float(d)/width);position[size_t(s)*width+d]=std::sin(z);position[size_t(s)*width+d+1]=std::cos(z);}
     const std::string p(prefix); std::vector<float> state;
     { auto*ctx=ggml_init({128ULL*1024*1024,nullptr,true}); if(!ctx)return std::unexpected("GGML context allocation failed"); auto*m=linear(ctx,input(ctx,motion,int(motion_dim),int(frames),int(batch)),weight(w,p+"input_linear.weight"),weight(w,p+"input_linear.bias")); auto*te=linear(ctx,input(ctx,text,4096,text_tokens,int(batch)),weight(w,p+"embed_text.weight"),weight(w,p+"embed_text.bias")); auto*ti=linear(ctx,input(ctx,time,width,1,int(batch)),weight(w,p+"embed_timestep.time_embed.0.weight"),weight(w,p+"embed_timestep.time_embed.0.bias"));ti=linear(ctx,ggml_silu(ctx,ti),weight(w,p+"embed_timestep.time_embed.2.weight"),weight(w,p+"embed_timestep.time_embed.2.bias"));auto*he=linear(ctx,input(ctx,angle,2,1,int(batch)),weight(w,p+"linear_first_heading_angle.weight"),weight(w,p+"linear_first_heading_angle.bias"));auto*x=ggml_concat(ctx,ggml_concat(ctx,ggml_concat(ctx,te,ti,1),he,1),m,1);auto*pos=input(ctx,position,width,seq,1);x=ggml_add(ctx,x,ggml_repeat(ctx,pos,x));auto r=execute(ctx,x,size_t(width)*seq*batch,w.backend());ggml_free(ctx);if(!r)return std::unexpected(r.error());state=std::move(*r); }
-    for(int i=0;i<16;++i){auto*ctx=ggml_init({128ULL*1024*1024,nullptr,true});if(!ctx)return std::unexpected("GGML context allocation failed");auto*x=layer(ctx,input(ctx,state,width,seq,int(batch)),w,p+"seqTransEncoder.layers."+std::to_string(i)+".",seq,int(batch));auto r=execute(ctx,x,size_t(width)*seq*batch,w.backend());ggml_free(ctx);if(!r)return std::unexpected(r.error());state=std::move(*r);}
-    auto*ctx=ggml_init({32ULL*1024*1024,nullptr,true});if(!ctx)return std::unexpected("GGML context allocation failed");auto*all=input(ctx,state,width,seq,int(batch));auto*part=ggml_view_3d(ctx,all,width,frames,batch,all->nb[1],all->nb[2],size_t(prefix_tokens)*width*sizeof(float));part=ggml_cont(ctx,part);auto*y=linear(ctx,part,weight(w,p+"output_linear.weight"),weight(w,p+"output_linear.bias"));const size_t outdim=size_t(weight(w,p+"output_linear.bias")->ne[0]);auto r=execute(ctx,y,outdim*frames*batch,w.backend());ggml_free(ctx);return r;
+    const int layer_chunk = motion_layer_chunk_size();
+    for(int first=0;first<16;first+=layer_chunk){
+        auto*ctx=ggml_init({256ULL*1024*1024,nullptr,true});
+        if(!ctx)return std::unexpected("GGML context allocation failed");
+        auto*x=input(ctx,state,width,seq,int(batch));
+        for(int i=first;i<std::min(first+layer_chunk,16);++i)
+            x=layer(ctx,x,w,p+"seqTransEncoder.layers."+std::to_string(i)+".",seq,int(batch));
+        auto r=execute(ctx,x,size_t(width)*seq*batch,w.backend());
+        ggml_free(ctx);
+        if(!r)return std::unexpected(r.error());
+        state=std::move(*r);
+    }
+    auto*ctx=ggml_init({32ULL*1024*1024,nullptr,true});if(!ctx)return std::unexpected("GGML context allocation failed");auto*all=input(ctx,state,width,seq,int(batch));auto*part=ggml_view_3d(ctx,all,width,frames,batch,all->nb[1],all->nb[2],size_t(prefix_tokens)*width*sizeof(float));part=ggml_cont(ctx,part);auto*y=linear(ctx,part,weight(w,p+"output_linear.weight"),weight(w,p+"output_linear.bias"));const size_t outdim=size_t(weight(w,p+"output_linear.bias")->ne[0]);auto r=execute(ctx,y,outdim*frames*batch,w.backend());ggml_free(ctx);
+    if (profile_enabled()) {
+        std::fprintf(stderr,
+                     "profile motion.transformer stage=%.*s calls=%u graph_ms=%.3f allocation_ms=%.3f upload_ms=%.3f compute_ms=%.3f download_ms=%.3f total_ms=%.3f\n",
+                     static_cast<int>(prefix.size() - 1), prefix.data(), profile.calls, profile.graph_ms,
+                     profile.allocation_ms, profile.upload_ms, profile.compute_ms, profile.download_ms,
+                     profile_elapsed_ms(profile_started));
+    }
+    return r;
 } catch(const std::exception&e){inputs.clear();return std::unexpected(e.what());}
 
 std::expected<std::vector<float>, std::string> run_two_stage_denoiser(
@@ -162,11 +223,14 @@ std::expected<std::vector<float>, std::string> sample_motion_from_noise(
     auto schedule=make_cosine_schedule(1000,steps); if(!schedule)return std::unexpected(schedule.error());
     std::vector<float> state(initial.begin(),initial.end()), next(state.size());
     for(unsigned i=steps;i-->0;) {
+        const auto step_started = std::chrono::steady_clock::now();
         auto clean=run_separated_cfg_denoiser(weights,state,embedding,float(schedule->use_timesteps[i]),text_weight,constraint_weight,frames);
         if(!clean)return std::unexpected(clean.error());
         auto stepped=ddim_step(*schedule,i,state.data(),clean->data(),next.data(),state.size());
         if(!stepped)return std::unexpected(stepped.error());
         state.swap(next);
+        if (profile_enabled())
+            std::fprintf(stderr, "profile motion.diffusion_step index=%u ms=%.3f\n", i, profile_elapsed_ms(step_started));
     }
     return state;
 }

@@ -6,10 +6,13 @@
 #include "denoiser.hpp"
 #include "motion_decode.hpp"
 #include "llm_text_encoder.hpp"
+#include "profile.hpp"
 #endif
 
+#include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
 #include <random>
 
 namespace kimodo {
@@ -67,33 +70,44 @@ std::expected<motion_data, std::string> model::generate_embedding(
     if (!std::isfinite(text_cfg) || !std::isfinite(constraint_cfg)) return std::unexpected("CFG weights must be finite");
     for (float value : embedding) if (!std::isfinite(value)) return std::unexpected("embedding contains a non-finite value");
 #ifdef KIMODO_HAVE_GGML
+    const auto generate_started = std::chrono::steady_clock::now();
     // Weight residency is deferred until inference so model-load stays a
     // bounded metadata operation.  The graph integration consumes this exact
     // session; no separate unchecked tensor loader exists in the runtime.
     if (!impl_->weights) {
+        const auto weights_started = std::chrono::steady_clock::now();
         auto loaded = detail::ggml_motion_weights::load(impl_->motion_path);
         if (!loaded) return std::unexpected(loaded.error());
         impl_->weights = std::move(*loaded);
+        if (detail::profile_enabled())
+            std::fprintf(stderr, "profile motion.weights_ready_ms=%.3f\n", detail::profile_elapsed_ms(weights_started));
     }
     std::mt19937_64 rng(seed);
     std::normal_distribution<float> normal(0.f, 1.f);
     const size_t motion_dim=impl_->skeleton->motion_dim();
     std::vector<float> noise(static_cast<size_t>(frames)*motion_dim);
     for (float &value : noise) value = normal(rng);
+    const auto sampling_started = std::chrono::steady_clock::now();
     auto sampled = detail::sample_motion_from_noise(*impl_->weights, noise, embedding, frames, steps, text_cfg, constraint_cfg);
     if (!sampled) return std::unexpected(sampled.error());
+    const double sampling_ms = detail::profile_elapsed_ms(sampling_started);
     auto global_mean=impl_->weights->f32_values("stats.global_root.mean"), global_std=impl_->weights->f32_values("stats.global_root.std");
     auto body_mean=impl_->weights->f32_values("stats.body.mean"), body_std=impl_->weights->f32_values("stats.body.std");
     if (!global_mean) return std::unexpected(global_mean.error());
     if (!global_std) return std::unexpected(global_std.error());
     if (!body_mean) return std::unexpected(body_mean.error());
     if (!body_std) return std::unexpected(body_std.error());
+    const auto decode_started = std::chrono::steady_clock::now();
     auto decoded=detail::decode_motion(*sampled,frames,*impl_->skeleton,*global_mean,*global_std,*body_mean,*body_std);
     if (!decoded) return std::unexpected(decoded.error());
     motion_data result;
     result.frames=frames; result.joints=static_cast<unsigned>(impl_->skeleton->joints());
     result.local_rotations_xyzw=std::move(decoded->local_xyzw);
     result.root_positions=std::move(decoded->root_positions);
+    if (detail::profile_enabled())
+        std::fprintf(stderr, "profile motion.generate sampling_ms=%.3f decode_ms=%.3f total_ms=%.3f\n",
+                     sampling_ms, detail::profile_elapsed_ms(decode_started),
+                     detail::profile_elapsed_ms(generate_started));
     return result;
 #else
     return std::unexpected("Kimodo was built without GGML support");
@@ -108,6 +122,20 @@ std::expected<motion_data, std::string> model::generate_text_sequence(
     if (segments.empty() || segments.size() > 16) return std::unexpected("sequence requires 1..16 prompt segments");
     if (steps == 0 || steps > 1000 || transition_frames == 0 || transition_frames > 60)
         return std::unexpected("invalid sequence sampling parameters");
+    std::vector<std::array<float, embedding_width>> embeddings;
+    embeddings.reserve(segments.size());
+    for (size_t index=0; index<segments.size(); ++index) {
+        const auto &segment=segments[index];
+        if (segment.prompt.empty() || segment.frames < 2 || segment.frames > 300)
+            return std::unexpected("each sequence segment must contain a prompt and have 2..300 frames");
+        if (index && transition_frames >= segment.frames) return std::unexpected("transition must be shorter than every following segment");
+        auto embedding=impl_->text->encode(segment.prompt);
+        if (!embedding) return std::unexpected(embedding.error());
+        embeddings.push_back(*embedding);
+    }
+    // Initialize and warm the quantized text backend before the F32 motion
+    // backend applies its process-wide Vulkan parity flags. This preserves
+    // cooperative-matrix text kernels in persistent sequence workers.
     if (!impl_->weights) {
         auto loaded = detail::ggml_motion_weights::load(impl_->motion_path);
         if (!loaded) return std::unexpected(loaded.error());
@@ -117,23 +145,16 @@ std::expected<motion_data, std::string> model::generate_text_sequence(
     auto gm=impl_->weights->f32_values("stats.global_root.mean"), gs=impl_->weights->f32_values("stats.global_root.std");
     if (!gm || !gs || !bm || !bs) return std::unexpected("motion GGUF lacks normalization statistics");
     std::mt19937_64 rng(seed); std::normal_distribution<float> normal(0.f, 1.f);
-    std::vector<std::array<float, embedding_width>> embeddings;
     std::vector<std::vector<float>> noise;
     std::vector<detail::sampled_sequence_segment> sampled;
-    embeddings.reserve(segments.size()); noise.reserve(segments.size()); sampled.reserve(segments.size());
+    noise.reserve(segments.size()); sampled.reserve(segments.size());
     for (size_t index=0; index<segments.size(); ++index) {
         const auto &segment=segments[index];
-        if (segment.prompt.empty() || segment.frames < 2 || segment.frames > 300)
-            return std::unexpected("each sequence segment must contain a prompt and have 2..300 frames");
-        if (index && transition_frames >= segment.frames) return std::unexpected("transition must be shorter than every following segment");
-        auto embedding=impl_->text->encode(segment.prompt);
-        if (!embedding) return std::unexpected(embedding.error());
         const auto sampled_frames = static_cast<size_t>(segment.frames) +
             (index == 0 ? 0 : transition_frames);
-        embeddings.push_back(*embedding);
         noise.emplace_back(sampled_frames*impl_->skeleton->motion_dim());
         for (float &value : noise.back()) value=normal(rng);
-        sampled.push_back({embeddings.back(), noise.back(), segment.frames});
+        sampled.push_back({embeddings[index], noise.back(), segment.frames});
     }
     auto joined=detail::sample_motion_sequence_from_noise(*impl_->weights,sampled,transition_frames,steps,text_cfg,constraint_cfg);
     if (!joined) return std::unexpected(joined.error());

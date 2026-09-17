@@ -3,6 +3,7 @@
 // reference. No llama.cpp source is copied.
 #include "llm_text_encoder.hpp"
 #include "llm_tokenizer.hpp"
+#include "profile.hpp"
 
 #include <ggml.h>
 #include <ggml-alloc.h>
@@ -15,6 +16,7 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,8 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -45,6 +49,17 @@ int layer_chunk_size() {
     if (error != std::errc{} || *end != '\0' || parsed < 1 || parsed > 32)
         throw std::runtime_error("KIMODO_TEXT_LAYER_CHUNK must be in 1..32");
     return parsed;
+}
+
+uintmax_t resident_limit_bytes() {
+    const char *value = std::getenv("KIMODO_TEXT_RESIDENT_LIMIT_MIB");
+    if (!value) return std::numeric_limits<uintmax_t>::max();
+    uintmax_t parsed = 0;
+    const auto [end, error] = std::from_chars(value, value + std::strlen(value), parsed);
+    if (error != std::errc{} || *end != '\0' || parsed == 0 ||
+        parsed > std::numeric_limits<uintmax_t>::max() / (1024U * 1024U))
+        throw std::runtime_error("KIMODO_TEXT_RESIDENT_LIMIT_MIB must be a positive integer");
+    return parsed * 1024U * 1024U;
 }
 
 int cpu_thread_count() noexcept {
@@ -73,6 +88,7 @@ struct component {
 };
 
 std::unique_ptr<component> open_component(const std::filesystem::path &path, ggml_backend_t backend) {
+    const auto started = std::chrono::steady_clock::now();
     auto result = std::make_unique<component>();
     gguf_init_params params{true, &result->ctx};
     result->file = gguf_init_from_file(path.string().c_str(), params);
@@ -84,6 +100,7 @@ std::unique_ptr<component> open_component(const std::filesystem::path &path, ggm
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot reopen text component " + path.string());
     const auto data_offset = gguf_get_data_offset(result->file);
+    size_t total_bytes = 0;
     std::vector<char> scratch(8U * 1024U * 1024U);
     for (int64_t i = 0; i < gguf_get_n_tensors(result->file); ++i) {
         auto *tensor = ggml_get_tensor(result->ctx, gguf_get_tensor_name(result->file, i));
@@ -92,6 +109,7 @@ std::unique_ptr<component> open_component(const std::filesystem::path &path, ggm
                         tensor->type != GGML_TYPE_Q5_K && tensor->type != GGML_TYPE_Q4_K))
             throw std::runtime_error("invalid text tensor");
         const size_t bytes = ggml_nbytes(tensor);
+        total_bytes += bytes;
         const size_t offset = gguf_get_tensor_offset(result->file, i);
         in.seekg(static_cast<std::streamoff>(data_offset + offset));
         for (size_t done = 0; done < bytes;) {
@@ -101,6 +119,11 @@ std::unique_ptr<component> open_component(const std::filesystem::path &path, ggm
             ggml_backend_tensor_set(tensor, scratch.data(), done, n);
             done += n;
         }
+    }
+    if (profile_enabled()) {
+        std::fprintf(stderr, "profile text.upload component=%s mib=%.2f ms=%.3f\n",
+                     path.filename().string().c_str(),
+                     static_cast<double>(total_bytes) / (1024.0 * 1024.0), profile_elapsed_ms(started));
     }
     return result;
 }
@@ -168,9 +191,12 @@ ggml_tensor *layer_graph(ggml_context *ctx, ggml_tensor *x, ggml_tensor *positio
     auto *ffn_norm = model.tensor("ffn_norm.weight");
     if (!attn_norm || !ffn_norm) throw std::runtime_error("missing layer norm");
     auto *residual = ggml_cast(ctx, x, GGML_TYPE_BF16);
-    auto *q = linear("attn_q_proj", norm(ctx, residual, attn_norm));
-    auto *k = linear("attn_k_proj", norm(ctx, residual, attn_norm));
-    auto *v = linear("attn_v_proj", norm(ctx, residual, attn_norm));
+    // Q, K, and V consume the same normalized state. Building that subgraph
+    // once avoids two redundant RMS norms plus their casts and scale ops.
+    auto *attn_input = norm(ctx, residual, attn_norm);
+    auto *q = linear("attn_q_proj", attn_input);
+    auto *k = linear("attn_k_proj", attn_input);
+    auto *v = linear("attn_v_proj", attn_input);
     q = ggml_reshape_3d(ctx, q, head_dim, heads, seq);
     k = ggml_reshape_3d(ctx, k, head_dim, kv_heads, seq);
     v = ggml_reshape_3d(ctx, v, head_dim, kv_heads, seq);
@@ -192,7 +218,7 @@ ggml_tensor *layer_graph(ggml_context *ctx, ggml_tensor *x, ggml_tensor *positio
     return output;
 }
 
-std::vector<float> run_layer_chunk(const std::vector<std::unique_ptr<component>> &layers,
+std::vector<float> run_layer_chunk(std::span<const std::unique_ptr<component>> layers,
                                    const std::vector<float> &input, ggml_backend_t backend) {
     const int64_t seq = static_cast<int64_t>(input.size() / hidden);
     auto *ctx = ggml_init({128ULL * 1024ULL * 1024ULL, nullptr, true});
@@ -223,6 +249,11 @@ struct llm_text_encoder::impl {
     std::filesystem::path directory;
     std::unique_ptr<llm_tokenizer> tokenizer;
     ggml_backend_t backend = nullptr;
+    int layer_chunk = 8;
+    std::unique_ptr<component> embedding;
+    std::vector<std::unique_ptr<component>> layers;
+    std::unique_ptr<component> final_norm;
+    mutable std::mutex encode_mutex;
     ~impl() { if (backend) ggml_backend_free(backend); }
 };
 
@@ -248,16 +279,47 @@ std::expected<std::unique_ptr<llm_text_encoder>, std::string> llm_text_encoder::
     if (!tokenizer) return std::unexpected(tokenizer.error());
     result->impl_->directory = path;
     result->impl_->tokenizer = std::move(*tokenizer);
+    result->impl_->layer_chunk = layer_chunk_size();
+    uintmax_t bundle_bytes = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(path))
+        if (entry.is_regular_file() && entry.path().extension() == ".gguf")
+            bundle_bytes += entry.file_size();
+    if (result->impl_->layer_chunk == 32 && bundle_bytes <= resident_limit_bytes()) {
+        const auto started = std::chrono::steady_clock::now();
+        result->impl_->embedding = open_component(path / "embedding.gguf", result->impl_->backend);
+        result->impl_->layers.reserve(32);
+        for (int i = 0; i < 32; ++i) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "layer-%02d.gguf", i);
+            result->impl_->layers.push_back(open_component(path / name, result->impl_->backend));
+        }
+        result->impl_->final_norm = open_component(path / "final-norm.gguf", result->impl_->backend);
+        if (profile_enabled())
+            std::fprintf(stderr, "profile text.resident_load layers=32 ms=%.3f\n", profile_elapsed_ms(started));
+    } else if (profile_enabled() && result->impl_->layer_chunk == 32) {
+        std::fprintf(stderr, "profile text.resident_skipped bundle_mib=%.2f limit_mib=%.2f\n",
+                     static_cast<double>(bundle_bytes) / (1024.0 * 1024.0),
+                     static_cast<double>(resident_limit_bytes()) / (1024.0 * 1024.0));
+    }
     return result;
 } catch (const std::exception &error) { return std::unexpected(error.what()); }
 
 std::expected<std::array<float, 4096>, std::string> llm_text_encoder::encode(std::string_view prompt) const try {
+    const std::scoped_lock lock(impl_->encode_mutex);
+    const auto encode_started = std::chrono::steady_clock::now();
     auto ids = impl_->tokenizer->encode(prompt);
     if (!ids) return std::unexpected(ids.error());
     if (ids->size() < 2 || ids->size() > 512) return std::unexpected("prompt token count must be in 1..511 excluding BOS");
     std::vector<float> state;
+    double embedding_ms = 0.0, layers_ms = 0.0, final_ms = 0.0;
     {
-        auto embedding = open_component(impl_->directory / "embedding.gguf", impl_->backend);
+        const auto started = std::chrono::steady_clock::now();
+        std::unique_ptr<component> temporary;
+        component *embedding = impl_->embedding.get();
+        if (!embedding) {
+            temporary = open_component(impl_->directory / "embedding.gguf", impl_->backend);
+            embedding = temporary.get();
+        }
         auto *weight = embedding->tensor("token_embedding.weight");
         if (!weight) throw std::runtime_error("text bundle missing token_embedding.weight");
         auto *ctx = ggml_init({2ULL * 1024ULL * 1024ULL, nullptr, true});
@@ -274,17 +336,39 @@ std::expected<std::array<float, 4096>, std::string> llm_text_encoder::encode(std
         ggml_backend_tensor_set(indices, values.data(), 0, values.size() * sizeof(int32_t));
         if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("embedding graph failed");
         state = read_output(rows);
+        embedding_ms = profile_elapsed_ms(started);
     }
-    const int chunk = layer_chunk_size();
-    for (int first = 0; first < 32; first += chunk) {
-        std::vector<std::unique_ptr<component>> layers;
-        for (int i = first; i < std::min(first + chunk, 32); ++i) {
-            char name[32]; std::snprintf(name, sizeof(name), "layer-%02d.gguf", i);
-            layers.push_back(open_component(impl_->directory / name, impl_->backend));
+    {
+        const auto started = std::chrono::steady_clock::now();
+        // Eight layers fit comfortably within GGML's default graph capacity.
+        // A resident 32-layer model keeps every weight buffer alive while
+        // executing four bounded graphs, avoiding both re-upload and the
+        // oversized-graph failure of treating residency as graph fusion.
+        constexpr int max_graph_layers = 8;
+        const int graph_chunk = std::min(impl_->layer_chunk, max_graph_layers);
+        for (int first = 0; first < 32; first += graph_chunk) {
+            if (!impl_->layers.empty()) {
+                const auto count = static_cast<size_t>(std::min(graph_chunk, 32 - first));
+                state = run_layer_chunk(std::span(impl_->layers).subspan(static_cast<size_t>(first), count),
+                                        state, impl_->backend);
+                continue;
+            }
+            std::vector<std::unique_ptr<component>> layers;
+            for (int i = first; i < std::min(first + graph_chunk, 32); ++i) {
+                char name[32]; std::snprintf(name, sizeof(name), "layer-%02d.gguf", i);
+                layers.push_back(open_component(impl_->directory / name, impl_->backend));
+            }
+            state = run_layer_chunk(layers, state, impl_->backend);
         }
-        state = run_layer_chunk(layers, state, impl_->backend);
+        layers_ms = profile_elapsed_ms(started);
     }
-    auto final = open_component(impl_->directory / "final-norm.gguf", impl_->backend);
+    const auto final_started = std::chrono::steady_clock::now();
+    std::unique_ptr<component> temporary_final;
+    component *final = impl_->final_norm.get();
+    if (!final) {
+        temporary_final = open_component(impl_->directory / "final-norm.gguf", impl_->backend);
+        final = temporary_final.get();
+    }
     auto *weight = final->tensor("final_norm.weight");
     if (!weight) throw std::runtime_error("text bundle missing final_norm.weight");
     auto *ctx = ggml_init({8ULL * 1024ULL * 1024ULL, nullptr, true});
@@ -304,6 +388,13 @@ std::expected<std::array<float, 4096>, std::string> llm_text_encoder::encode(std
     for (size_t token = 1; token < ids->size(); ++token)
         for (size_t dim = 0; dim < pooled.size(); ++dim) pooled[dim] += state[token * pooled.size() + dim];
     for (float &value : pooled) value /= float(ids->size() - 1);
+    final_ms = profile_elapsed_ms(final_started);
+    if (profile_enabled()) {
+        std::fprintf(stderr,
+                     "profile text.encode tokens=%zu embedding_ms=%.3f layers_ms=%.3f final_ms=%.3f total_ms=%.3f resident=%d\n",
+                     ids->size(), embedding_ms, layers_ms, final_ms, profile_elapsed_ms(encode_started),
+                     impl_->layers.empty() ? 0 : 1);
+    }
     return pooled;
 } catch (const std::exception &error) { return std::unexpected(error.what()); }
 } // namespace kimodo::detail

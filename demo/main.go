@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"embed"
 	"encoding/binary"
@@ -10,6 +11,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -85,6 +87,63 @@ type gallery struct {
 	queue             chan string
 	models            map[string]motionModel
 	textBundles       map[string]textBundle
+}
+
+type generatorSession struct {
+	key    string
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+}
+
+func startGeneratorSession(generator string, model motionModel, text textBundle) (*generatorSession, error) {
+	cmd := exec.Command(generator, "--server", model.Motion, text.Path)
+	cmd.Env = append(os.Environ(), "KIMODO_BACKEND=vulkan", "KIMODO_TEXT_LAYER_CHUNK=32", "KIMODO_TEXT_RESIDENT_LIMIT_MIB=10000")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
+	return &generatorSession{key: model.Motion + "\x00" + text.Path, cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+}
+
+func (session *generatorSession) close() {
+	if session == nil {
+		return
+	}
+	_ = session.stdin.Close()
+	_ = session.cmd.Wait()
+}
+
+func (session *generatorSession) generate(item *animation, dir string, segments []promptSegment, promptPaths []string) error {
+	fields := []string{fmt.Sprint(item.TransitionFrames), fmt.Sprint(item.DiffusionSteps), fmt.Sprint(item.Seed), dir}
+	for index, segment := range segments {
+		fields = append(fields, fmt.Sprint(segment.Frames), promptPaths[index])
+	}
+	if _, err := fmt.Fprintln(session.stdin, strings.Join(fields, "\t")); err != nil {
+		return err
+	}
+	response, err := session.stdout.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("native worker stopped: %w", err)
+	}
+	response = strings.TrimSpace(response)
+	if strings.HasPrefix(response, "ERR\t") {
+		return fmt.Errorf("native worker: %s", strings.TrimPrefix(response, "ERR\t"))
+	}
+	if !strings.HasPrefix(response, "OK\t") {
+		return fmt.Errorf("invalid native worker response %q", response)
+	}
+	return nil
 }
 
 func token() string {
@@ -302,6 +361,8 @@ func exportSkeletonGLB(dir, skeletonKey string) error {
 }
 
 func (g *gallery) worker() {
+	var session *generatorSession
+	defer func() { session.close() }()
 	for id := range g.queue {
 		g.mu.Lock()
 		item := g.items[id]
@@ -320,7 +381,7 @@ func (g *gallery) worker() {
 			} else {
 				textID := item.TextQuantization
 				if textID == "" {
-					textID = "bf16"
+					textID = "q8_0"
 				}
 				text, textOK := g.textBundles[textID]
 				if !textOK || !text.Available {
@@ -331,24 +392,30 @@ func (g *gallery) worker() {
 					if len(segments) == 0 {
 						segments = []promptSegment{{Prompt: item.Prompt, Frames: item.Frames}}
 					}
-					args := []string{model.Motion, text.Path, "--sequence", fmt.Sprint(item.TransitionFrames), fmt.Sprint(item.DiffusionSteps), fmt.Sprint(item.Seed), dir}
+					promptPaths := make([]string, 0, len(segments))
 					for index, segment := range segments {
 						promptPath := filepath.Join(dir, fmt.Sprintf("segment-%02d.txt", index+1))
 						if err = os.WriteFile(promptPath, []byte(segment.Prompt), 0600); err != nil {
 							break
 						}
-						args = append(args, fmt.Sprint(segment.Frames), promptPath)
+						promptPaths = append(promptPaths, promptPath)
 					}
 					if err == nil {
 						g.mu.Lock()
 						item.Progress = fmt.Sprintf("Generating %d conditioned segments", len(segments))
 						_ = g.save(item)
 						g.mu.Unlock()
-						cmd := exec.Command(g.generator, args...)
-						cmd.Env = append(os.Environ(), "KIMODO_BACKEND=vulkan", "KIMODO_TEXT_LAYER_CHUNK=32")
-						output, runErr := cmd.CombinedOutput()
-						if runErr != nil {
-							err = fmt.Errorf("sequence: %w: %s", runErr, strings.TrimSpace(string(output)))
+						key := model.Motion + "\x00" + text.Path
+						if session == nil || session.key != key {
+							session.close()
+							session, err = startGeneratorSession(g.generator, model, text)
+						}
+						if err == nil {
+							err = session.generate(item, dir, segments, promptPaths)
+							if err != nil {
+								session.close()
+								session = nil
+							}
 						}
 					}
 					if err == nil {
@@ -609,7 +676,7 @@ func main() {
 			request.Model = "smplx-rp-v1"
 		}
 		if request.TextQuantization == "" {
-			request.TextQuantization = "bf16"
+			request.TextQuantization = "q8_0"
 		}
 		model, ok := g.models[request.Model]
 		if !ok || !model.Available {

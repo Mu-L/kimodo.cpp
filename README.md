@@ -89,9 +89,16 @@ node hierarchy (no mesh), ready to copy into a Three.js project. It is also
 available from `/api/animations/<animation-id>/animation.glb` while the demo
 is running.
 
-The demo loads all 32 text-encoder layers in one chunk for maximum throughput.
-Library and command-line callers retain the lower-memory eight-layer default;
-set `KIMODO_TEXT_LAYER_CHUNK=1..32` to choose another tradeoff.
+The demo keeps all 32 layers of its default Q8 text encoder in VRAM for maximum
+throughput, while executing them as bounded eight-layer GGML graphs. Its 10 GiB
+residency ceiling makes the larger BF16 reference stream in bounded groups on a
+16 GiB GPU. Library and command-line callers retain the lower-memory eight-layer
+default; set `KIMODO_TEXT_LAYER_CHUNK=32` for residency and optionally set
+`KIMODO_TEXT_RESIDENT_LIMIT_MIB` to enforce a VRAM-safe bundle-size ceiling.
+The demo reuses one native worker while the selected motion model and text
+quantization remain unchanged, preserving both weight sets across requests.
+Profiling controls, measurements, and the next optimization targets are in
+[`docs/PROFILING.md`](docs/PROFILING.md).
 
 Quantisation comparisons produced by the workflow in
 [`docs/QUANTIZATION.md`](docs/QUANTIZATION.md) can be opened at

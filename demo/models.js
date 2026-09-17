@@ -46,6 +46,9 @@ window.addEventListener('load', async () => {
     option.textContent = `${quantization.label}${quantization.available ? '' : ' — unavailable'}`;
     quantizationSelect.append(option);
   }
+  if (quantizations.some(quantization => quantization.id === 'q8_0' && quantization.available)) {
+    quantizationSelect.value = 'q8_0';
+  }
   const quantizationHint = document.createElement('div'); quantizationHint.className = 'hint';
   const updateQuantization = () => {
     const quantization = quantizations.find(item => item.id === quantizationSelect.value);
