@@ -1,5 +1,6 @@
 #include "ggml_weights.hpp"
 #include "gguf.hpp"
+#include "motion_graph_cache.hpp"
 #include "profile.hpp"
 
 #include <algorithm>
@@ -119,20 +120,33 @@ std::expected<std::unique_ptr<ggml_motion_weights>, std::string> ggml_motion_wei
     return result;
 }
 ggml_motion_weights::~ggml_motion_weights() {
+    graph_cache_.reset();
     if (allocator_) ggml_gallocr_free(allocator_);
     if (buffer_) ggml_backend_buffer_free(buffer_);
     if (gguf_) gguf_free(gguf_);
     if (context_) ggml_free(context_);
     if (backend_) ggml_backend_free(backend_);
 }
+motion_graph_cache *ggml_motion_weights::graph_cache() const noexcept {
+    return graph_cache_.get();
+}
+void ggml_motion_weights::graph_cache(std::unique_ptr<motion_graph_cache> cache) const noexcept {
+    graph_cache_ = std::move(cache);
+}
 ggml_tensor *ggml_motion_weights::tensor(std::string_view name) const {
     return context_ ? ggml_get_tensor(context_, std::string(name).c_str()) : nullptr;
 }
 std::expected<std::vector<float>, std::string> ggml_motion_weights::f32_values(std::string_view name) const {
+    const bool cache_on_host = name.starts_with("stats.");
+    if (cache_on_host) {
+        const auto found = host_f32_cache_.find(std::string(name));
+        if (found != host_f32_cache_.end()) return found->second;
+    }
     auto *value = tensor(name);
     if (!value || value->type != GGML_TYPE_F32) return std::unexpected("missing F32 GGML tensor: " + std::string(name));
     std::vector<float> result(static_cast<size_t>(ggml_nelements(value)));
     ggml_backend_tensor_get(value, result.data(), 0, result.size()*sizeof(float));
+    if (cache_on_host) host_f32_cache_.emplace(std::string(name), result);
     return result;
 }
 } // namespace kimodo::detail
